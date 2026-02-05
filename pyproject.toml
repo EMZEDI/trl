@@ -31,7 +31,9 @@ dependencies = [
     "accelerate>=1.4.0",
     "datasets>=3.0.0",
     "packaging>20.0",
+    "peft>=0.18.1",
     "transformers>=4.56.2",
+    "wandb>=0.24.2",
 ]
 dynamic = ["version"]
 
