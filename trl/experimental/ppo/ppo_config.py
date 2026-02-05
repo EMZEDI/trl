@@ -299,6 +299,31 @@ class PPOConfig(TrainingArguments):
             "exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation."
         },
     )
+    dart_enabled: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable DART (Dual Adaptive Residual Tracking) for improved value estimation."},
+    )
+    dart_lambda_res: float = field(
+        default=0.9999,
+        metadata={
+            "help": "Lambda value for residual GAE in DART. Higher values (closer to 1) give lower bias but higher "
+            "variance. Typical range: [0.99, 1.0]."
+        },
+    )
+    dart_lr_scale: float = field(
+        default=0.17,
+        metadata={
+            "help": "Learning rate scale for the residual critic in DART. The residual critic uses "
+            "`learning_rate * dart_lr_scale`. Typical range: (0, 1]."
+        },
+    )
+    dart_warmup_frac: float = field(
+        default=0.4,
+        metadata={
+            "help": "Fraction of total training episodes to warmup before activating the residual critic in DART. "
+            "During warmup, only the base critic is active. Typical range: [0, 1)."
+        },
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
@@ -310,5 +335,23 @@ class PPOConfig(TrainingArguments):
         if self.gradient_checkpointing and Version(transformers.__version__) < Version("5.0.0"):
             self.gradient_checkpointing_kwargs = self.gradient_checkpointing_kwargs or {}
             self.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
+
+        # DART validation
+        if self.dart_enabled:
+            if not (0.9 <= self.dart_lambda_res <= 1.0):
+                raise ValueError(
+                    f"dart_lambda_res must be in [0.9, 1.0], got {self.dart_lambda_res}. "
+                    "Higher values reduce bias but increase variance in residual value estimation."
+                )
+            if not (0 < self.dart_lr_scale <= 1.0):
+                raise ValueError(
+                    f"dart_lr_scale must be in (0, 1], got {self.dart_lr_scale}. "
+                    "This scales the learning rate for the residual critic."
+                )
+            if not (0 <= self.dart_warmup_frac < 1.0):
+                raise ValueError(
+                    f"dart_warmup_frac must be in [0, 1), got {self.dart_warmup_frac}. "
+                    "This fraction of training is used to warmup before activating the residual critic."
+                )
 
         super().__post_init__()

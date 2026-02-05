@@ -275,17 +275,26 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = T
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
-    def __init__(self, policy, value_model) -> None:
+    def __init__(self, policy, value_model, value_model_residual=None) -> None:
         super().__init__()
         self.policy = policy
         self.value_model = value_model
+        self.value_model_residual = value_model_residual
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
+        if value_model_residual is not None:
+            self.critic_backbone_residual = getattr(value_model_residual, value_model_residual.base_model_prefix)
         self.is_gradient_checkpointing = policy.is_gradient_checkpointing
 
     def forward(self, **kwargs):
         output = self.critic_backbone(**kwargs)
-        logits = self.value_model.score(output.hidden_states[-1])
-        return self.policy(**kwargs), logits
+        logits_base = self.value_model.score(output.hidden_states[-1])
+        
+        if self.value_model_residual is not None:
+            output_res = self.critic_backbone_residual(**kwargs)
+            logits_residual = self.value_model_residual.score(output_res.hidden_states[-1])
+            return self.policy(**kwargs), logits_base, logits_residual
+        
+        return self.policy(**kwargs), logits_base, None
 
 
 class PPOTrainer(BaseTrainer):
@@ -349,6 +358,7 @@ class PPOTrainer(BaseTrainer):
         reward_model: nn.Module,
         train_dataset: Dataset,
         value_model: nn.Module,
+        value_model_residual: nn.Module | None = None,
         data_collator: DataCollatorWithPadding | None = None,
         eval_dataset: Dataset | dict[str, Dataset] | None = None,
         # less commonly used
@@ -424,10 +434,23 @@ class PPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        self.value_model_residual = value_model_residual
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+        # DART: Check for residual value model consistency
+        if args.dart_enabled and value_model_residual is None:
+            raise ValueError(
+                "DART is enabled but no residual value model provided. "
+                "Please provide a `value_model_residual` parameter."
+            )
+        if not args.dart_enabled and value_model_residual is not None:
+            raise ValueError(
+                "Residual value model provided but DART is not enabled. "
+                "Please set `args.dart_enabled=True` or remove `value_model_residual`."
+            )
 
         #########
         # calculate various batch sizes
@@ -463,14 +486,51 @@ class PPOTrainer(BaseTrainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
+        for module in [self.policy_model, self.ref_model, self.value_model, self.value_model_residual, self.reward_model]:
             if module is not None:
                 disable_dropout_in_model(module)
-        self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
+        self.model = PolicyAndValueWrapper(self.policy_model, self.value_model, self.value_model_residual)
         self.model.config = self.policy_model.config  # needed for pushing to hub
-        self.create_optimizer_and_scheduler(
-            num_training_steps=args.num_total_batches
-        )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
+        
+        # DART: compute warmup steps
+        if args.dart_enabled:
+            self.warmup_steps = int(args.total_episodes * args.dart_warmup_frac)
+        
+        # DART: Create separate optimizers if enabled and no custom optimizers provided
+        if args.dart_enabled and optimizers == (None, None):
+            # Base optimizer: actor + base critic
+            base_params = list(self.policy_model.parameters()) + list(self.value_model.parameters())
+            self.optimizer_base = torch.optim.AdamW(base_params, lr=args.learning_rate, eps=1e-5)
+            
+            # Residual optimizer: residual critic only
+            self.optimizer_res = torch.optim.AdamW(
+                self.value_model_residual.parameters(),
+                lr=args.learning_rate * args.dart_lr_scale,
+                eps=1e-5,
+            )
+            
+            # Create schedulers for both optimizers
+            from transformers.optimization import get_scheduler
+            self.lr_scheduler_base = get_scheduler(
+                name=args.lr_scheduler_type,
+                optimizer=self.optimizer_base,
+                num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
+                num_training_steps=args.num_total_batches,
+            )
+            self.lr_scheduler_res = get_scheduler(
+                name=args.lr_scheduler_type,
+                optimizer=self.optimizer_res,
+                num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
+                num_training_steps=args.num_total_batches,
+            )
+            
+            # For compatibility, set the base optimizer as the default
+            self.optimizer = self.optimizer_base
+            self.lr_scheduler = self.lr_scheduler_base
+        else:
+            self.create_optimizer_and_scheduler(
+                num_training_steps=args.num_total_batches
+            )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
 
         #########
         # trainer specifics
@@ -517,7 +577,14 @@ class PPOTrainer(BaseTrainer):
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        if args.dart_enabled and hasattr(self, 'optimizer_base'):
+            # DART: Prepare model and both optimizers
+            self.model, self.optimizer_base, self.optimizer_res, self.dataloader = accelerator.prepare(
+                self.model, self.optimizer_base, self.optimizer_res, self.dataloader
+            )
+            self.optimizer = self.optimizer_base  # For compatibility
+        else:
+            self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
         self.eval_dataloader = DataLoader(
@@ -651,6 +718,10 @@ class PPOTrainer(BaseTrainer):
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
+            
+            # DART: Check if residual is active
+            is_residual_active = args.dart_enabled and (self.state.episode > self.warmup_steps)
+            
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
@@ -661,6 +732,8 @@ class PPOTrainer(BaseTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                values_base = []  # DART: Store base values separately
+                values_residual = []  # DART: Store residual values separately
                 with (
                     unwrap_model_for_generation(
                         self.model,
@@ -707,11 +780,26 @@ class PPOTrainer(BaseTrainer):
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    
+                    # DART: Get base and optionally residual value predictions
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    full_value, _, _ = get_reward(
+                    full_value_base, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    value_base = full_value_base[:, context_length - 1 : -1].squeeze(-1)
+                    
+                    if args.dart_enabled:
+                        unwrapped_value_model_res = accelerator.unwrap_model(model).value_model_residual
+                        full_value_res, _, _ = get_reward(
+                            unwrapped_value_model_res, query_response, processing_class.pad_token_id, context_length
+                        )
+                        value_res = full_value_res[:, context_length - 1 : -1].squeeze(-1)
+                        # Combined value = base + residual (if active), else just base
+                        value = value_base + value_res if is_residual_active else value_base
+                    else:
+                        value_res = torch.zeros_like(value_base)
+                        value = value_base
+                    
                     _, score, _ = get_reward(
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
@@ -723,6 +811,8 @@ class PPOTrainer(BaseTrainer):
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
                     values.append(value)
+                    values_base.append(value_base)
+                    values_residual.append(value_res)
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -730,7 +820,11 @@ class PPOTrainer(BaseTrainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
-                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
+                values_base = torch.cat(values_base, 0)  # DART
+                values_residual = torch.cat(values_residual, 0)  # DART
+                del (logprob, ref_logprob, full_value_base, value_base, value, score, unwrapped_model)
+                if args.dart_enabled:
+                    del (full_value_res, value_res, unwrapped_value_model_res)
                 empty_cache()
                 gc.collect()
 
@@ -749,6 +843,9 @@ class PPOTrainer(BaseTrainer):
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
+                values_base = torch.masked_fill(values_base, padding_mask_p1, 0)  # DART
+                if args.dart_enabled:
+                    values_residual = torch.masked_fill(values_residual, padding_mask_p1, 0)  # DART
 
                 # 4. compute rewards
                 # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
@@ -775,9 +872,22 @@ class PPOTrainer(BaseTrainer):
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                returns = advantages + values
+                returns_base = advantages + values  # Target for base critic
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
+                
+                # DART: Compute residual GAE with dart_lambda_res for residual critic
+                if args.dart_enabled:
+                    lastgaelam_res = 0
+                    advantages_res_reversed = []
+                    for t in reversed(range(gen_length)):
+                        nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                        delta_res = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                        lastgaelam_res = delta_res + args.gamma * args.dart_lambda_res * lastgaelam_res
+                        advantages_res_reversed.append(lastgaelam_res)
+                    advantages_res = torch.stack(advantages_res_reversed[::-1], axis=1)
+                    returns_residual = advantages_res + values  # Target for residual critic
+                
                 empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
@@ -796,40 +906,77 @@ class PPOTrainer(BaseTrainer):
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
-                            mb_return = returns[micro_batch_inds]
+                            mb_return_base = returns_base[micro_batch_inds]
                             mb_values = values[micro_batch_inds]
+                            mb_values_base = values_base[micro_batch_inds]
 
-                            output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
-                            logits = output.logits[:, context_length - 1 : -1]
+                            # Forward pass through model
+                            policy_output = forward(model.policy, mb_query_responses, processing_class.pad_token_id)
+                            logits = policy_output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                            vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
-                            vpredclipped = torch.clamp(
-                                vpred,
-                                mb_values - args.cliprange_value,
-                                mb_values + args.cliprange_value,
+                            
+                            # Get base critic prediction
+                            critic_output = forward(model.value_model, mb_query_responses, processing_class.pad_token_id)
+                            vpred_base = model.value_model.score(critic_output.hidden_states[-1])[:, context_length - 1 : -1].squeeze(-1)
+                            vpred_base = torch.masked_fill(vpred_base, padding_mask_p1[micro_batch_inds], 0)
+                            
+                            # Base critic loss
+                            vpredclipped_base = torch.clamp(
+                                vpred_base,
+                                mb_values_base - args.cliprange_value,
+                                mb_values_base + args.cliprange_value,
                             )
-                            vf_losses1 = torch.square(vpred - mb_return)
-                            vf_losses2 = torch.square(vpredclipped - mb_return)
-                            vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                            vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask_p1[micro_batch_inds])
+                            vf_losses1_base = torch.square(vpred_base - mb_return_base)
+                            vf_losses2_base = torch.square(vpredclipped_base - mb_return_base)
+                            vf_loss_max_base = torch.max(vf_losses1_base, vf_losses2_base)
+                            vf_loss_base = 0.5 * masked_mean(vf_loss_max_base, ~padding_mask_p1[micro_batch_inds])
                             vf_clipfrac = masked_mean(
-                                (vf_losses2 > vf_losses1).float(), ~padding_mask_p1[micro_batch_inds]
+                                (vf_losses2_base > vf_losses1_base).float(), ~padding_mask_p1[micro_batch_inds]
                             )
+                            
+                            # Policy loss
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
                             pg_losses = -mb_advantage * ratio
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
-                            loss = pg_loss + args.vf_coef * vf_loss
-                            accelerator.backward(loss)
-                            optimizer.step()
-                            optimizer.zero_grad()
+                            
+                            # Combined loss for base optimizer (policy + base critic)
+                            loss_base = pg_loss + args.vf_coef * vf_loss_base
+                            
+                            # DART: Residual critic loss (if active)
+                            if args.dart_enabled and is_residual_active:
+                                mb_return_res = returns_residual[micro_batch_inds]
+                                critic_res_output = forward(model.value_model_residual, mb_query_responses, processing_class.pad_token_id)
+                                vpred_res = model.value_model_residual.score(critic_res_output.hidden_states[-1])[:, context_length - 1 : -1].squeeze(-1)
+                                vpred_res = torch.masked_fill(vpred_res, padding_mask_p1[micro_batch_inds], 0)
+                                
+                                # Residual target: (returns_res - base_values.detach())
+                                residual_target = mb_return_res - mb_values_base.detach()
+                                vf_loss_res = 0.5 * masked_mean((vpred_res - residual_target) ** 2, ~padding_mask_p1[micro_batch_inds])
+                            else:
+                                vf_loss_res = torch.tensor(0.0, device=device)
+                            
+                            # Backward pass for base optimizer
+                            accelerator.backward(loss_base)
+                            if args.dart_enabled and hasattr(self, 'optimizer_base'):
+                                self.optimizer_base.step()
+                                self.optimizer_base.zero_grad()
+                            else:
+                                optimizer.step()
+                                optimizer.zero_grad()
+                            
+                            # Backward pass for residual optimizer (only if active)
+                            if args.dart_enabled and is_residual_active and hasattr(self, 'optimizer_res'):
+                                accelerator.backward(vf_loss_res)
+                                self.optimizer_res.step()
+                                self.optimizer_res.zero_grad()
+                            
                             with torch.no_grad():
                                 pg_clipfrac = masked_mean(
                                     (pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds]
@@ -842,7 +989,7 @@ class PPOTrainer(BaseTrainer):
                                     pg_clipfrac
                                 )
                                 pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                                vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                                vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss_base
                                 vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
                                     vf_clipfrac
                                 )
@@ -853,11 +1000,13 @@ class PPOTrainer(BaseTrainer):
                     # del everything and empty cache
                     # fmt: off
                     del (
-                        output, vpred_temp, logits, new_logprobs, vpred, vpredclipped,
-                        vf_losses1, vf_losses2, vf_loss, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
-                        pg_loss, loss, pg_clipfrac, prob_dist, entropy, approxkl, mb_return,
-                        mb_advantage, mb_values, mb_responses, mb_query_responses, mb_logprobs,
+                        policy_output, critic_output, logits, new_logprobs, vpred_base, vpredclipped_base,
+                        vf_losses1_base, vf_losses2_base, vf_loss_base, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
+                        pg_loss, loss_base, pg_clipfrac, prob_dist, entropy, approxkl, mb_return_base,
+                        mb_advantage, mb_values, mb_values_base, mb_responses, mb_query_responses, mb_logprobs,
                     )
+                    if args.dart_enabled and is_residual_active:
+                        del (critic_res_output, vpred_res, residual_target, vf_loss_res, mb_return_res)
                     # fmt: on
                     empty_cache()
             with torch.no_grad():
@@ -884,13 +1033,31 @@ class PPOTrainer(BaseTrainer):
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
-                metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+                if args.dart_enabled and hasattr(self, 'lr_scheduler_base'):
+                    metrics["lr_base"] = self.lr_scheduler_base.get_last_lr()[0]
+                    metrics["lr_res"] = self.lr_scheduler_res.get_last_lr()[0]
+                else:
+                    metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
+                
+                # DART: Additional logging
+                if args.dart_enabled:
+                    metrics["dart/is_active"] = float(is_residual_active)
+                    metrics["dart/mean_base_value"] = self.accelerator.gather_for_metrics(values_base.mean()).mean().item()
+                    if is_residual_active:
+                        metrics["dart/mean_residual_value"] = self.accelerator.gather_for_metrics(values_residual.mean()).mean().item()
+                        metrics["dart/mean_combined_value"] = self.accelerator.gather_for_metrics(values.mean()).mean().item()
+                
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
                 self.state.global_step += 1
                 self.log(metrics)
 
-            self.lr_scheduler.step()
+            # DART: Step both schedulers
+            if args.dart_enabled and hasattr(self, 'lr_scheduler_base'):
+                self.lr_scheduler_base.step()
+                self.lr_scheduler_res.step()
+            else:
+                self.lr_scheduler.step()
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None)
@@ -909,6 +1076,7 @@ class PPOTrainer(BaseTrainer):
                 logprobs,
                 ref_logprobs,
                 values,
+                values_base,
                 sequence_lengths,
                 contain_eos_token,
                 sequence_lengths_p1,
@@ -919,8 +1087,10 @@ class PPOTrainer(BaseTrainer):
                 actual_start,
                 actual_end,
                 advantages,
-                returns,
+                returns_base,
             )
+            if args.dart_enabled:
+                del (values_residual, advantages_res, returns_residual)
             empty_cache()
 
         # HF trainer specifics
