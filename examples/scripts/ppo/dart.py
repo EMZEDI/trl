@@ -110,6 +110,18 @@ if __name__ == "__main__":
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
 
+    # Helper: add a .score method for models that only expose a classifier head
+    def ensure_score(model):
+        if hasattr(model, "score"):
+            return model
+        if hasattr(model, "classifier"):
+            def score(hidden_states):
+                pooled = hidden_states[:, 0, :] if hidden_states.dim() == 3 else hidden_states
+                logits = model.classifier(pooled)
+                return logits.unsqueeze(-1) if logits.dim() == 2 else logits
+            model.score = score
+        return model
+
     ################
     # Model & Tokenizer
     ################
@@ -137,6 +149,7 @@ if __name__ == "__main__":
         num_labels=1,
         **model_kwargs,
     )
+    value_model = ensure_score(value_model)
     
     # DART: Create residual value model (only if DART is enabled)
     if training_args.dart_enabled:
@@ -152,6 +165,7 @@ if __name__ == "__main__":
             num_labels=1,
             **model_kwargs,
         )
+        value_model_residual = ensure_score(value_model_residual)
     else:
         print("DART disabled - running standard PPO baseline")
         value_model_residual = None
@@ -163,6 +177,7 @@ if __name__ == "__main__":
         num_labels=1,
         **model_kwargs,
     )
+    reward_model = ensure_score(reward_model)
     
     # Policy model
     policy = AutoModelForCausalLM.from_pretrained(
