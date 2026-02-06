@@ -223,6 +223,8 @@ if __name__ == "__main__":
             outputs = tokenizer(
                 element[dataset_text_field],
                 padding=False,
+                truncation=True,
+                max_length=512 - training_args.response_length,
             )
             return {"input_ids": outputs["input_ids"]}
 
