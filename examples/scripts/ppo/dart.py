@@ -35,11 +35,86 @@ from transformers import (
 )
 
 from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
+import trl.experimental.ppo.ppo_trainer
 from trl.experimental.ppo import PPOConfig, PPOTrainer
-
+from trl.experimental.utils import first_true_indices
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+
+
+# Monkey-patch get_reward to handle mismatched tokenizers (Qwen Policy vs DeBERTa Reward)
+original_get_reward = trl.experimental.ppo.ppo_trainer.get_reward
+
+def custom_get_reward(model, query_responses, pad_token_id, context_length):
+    # Check if this is the reward model requiring re-tokenization
+    if getattr(model, "needs_retokenization", False):
+        # query_responses contains Policy (Qwen) token IDs
+        # We must:
+        # 1. Decode back to text
+        # 2. Re-encode using Reward (DeBERTa) tokenizer
+        # 3. specific forward pass to get scalar reward
+        
+        # Access tokenizers attached to the model
+        policy_tokenizer = model.policy_tokenizer
+        reward_tokenizer = model.reward_tokenizer
+        device = query_responses.device
+        
+        # 1. Decode
+        texts = policy_tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+        
+        # 2. Encode (Ensure we don't exceed model limits e.g. 512)
+        # We generally expect the reward model to have a max_position_embeddings config
+        max_len = getattr(model.config, "max_position_embeddings", 512)
+        
+        encoded = reward_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        ).to(device)
+        
+        # 3. Run Forward Pass
+        # We cannot use model.score(hidden_states) based flow easily because we don't have hidden states of Qwen input.
+        # We run the full model forward on new inputs.
+        with torch.no_grad():
+            outputs = model(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                return_dict=True
+            )
+            # Depending on model type (SeqClass), logits should be (batch, 1) or (batch, num_labels)
+            # We assume it's set up as 1 label regression
+            scores = outputs.logits # (batch, 1)
+
+        # 4. Map scalar scores back to the sequence timeline for PPO
+        # PPO expects `reward_logits` of shape (batch, seq_len, 1) usually,
+        # where the last non-pad token holds the reward score.
+        
+        batch_size, seq_len = query_responses.shape
+        # Create a tensor of zeros/neutral value
+        dummy_logits = torch.zeros(batch_size, seq_len, 1, device=device, dtype=scores.dtype)
+        
+        # Find the end of the sequence in the POLICY's timeline
+        # (This aligns the reward with the end of generation)
+        seq_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
+        
+        final_rewards = scores.squeeze(-1) # (batch,)
+        
+        for i in range(batch_size):
+            # Clamp index to be safe
+            idx = min(seq_lengths[i], seq_len - 1)
+            dummy_logits[i, idx, 0] = final_rewards[i]
+            
+        return dummy_logits, final_rewards, seq_lengths
+    
+    else:
+        # Fallback to standard behavior for Value Model (Qwen) and Ref Model
+        return original_get_reward(model, query_responses, pad_token_id, context_length)
+
+# Apply the patch
+trl.experimental.ppo.ppo_trainer.get_reward = custom_get_reward
 
 
 """
@@ -122,13 +197,15 @@ if __name__ == "__main__":
             model.score = score
         return model
 
-    def resize_if_needed(model):
+    def resize_if_needed(model, tokenizer_to_use=None):
         if model is None:
             return model
+        if tokenizer_to_use is None:
+            tokenizer_to_use = tokenizer
         try:
             emb = model.get_input_embeddings()
-            if emb is not None and emb.num_embeddings != len(tokenizer):
-                model.resize_token_embeddings(len(tokenizer))
+            if emb is not None and emb.num_embeddings != len(tokenizer_to_use):
+                model.resize_token_embeddings(len(tokenizer_to_use))
         except Exception:
             pass
         return model
@@ -153,14 +230,25 @@ if __name__ == "__main__":
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     
+    # Load Reward Tokenizer (DeBERTa) explicitly
+    if training_args.reward_model_path != training_args.sft_model_path:
+        reward_tokenizer = AutoTokenizer.from_pretrained(
+            training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code
+        )
+    else:
+        reward_tokenizer = tokenizer
+
     # Base value model
+    # IMPORTANT: We load Value Model from SFT/Policy path (Qwen) to ensure tokenizers match for token-level updates.
+    # Using DeBERTa (Reward Model) as Value Model with a Qwen Policy causes tokenizer mismatches for the Critic.
+    print(f"Loading Value Model from {training_args.sft_model_path} (to match Policy structure)")
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
+        training_args.sft_model_path,
         trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
         **model_kwargs,
     )
-    value_model = ensure_score(resize_if_needed(value_model))
+    value_model = ensure_score(resize_if_needed(value_model, tokenizer))
     
     # DART: Create residual value model (only if DART is enabled)
     if training_args.dart_enabled:
@@ -171,24 +259,41 @@ if __name__ == "__main__":
         # TODO: this currently just creates a copy of the value model, but in practice one might want to
         # start from a random initialization. Consider adding a flag to control this behavior.
         value_model_residual = AutoModelForSequenceClassification.from_pretrained(
-            training_args.reward_model_path,
+            training_args.sft_model_path,
             trust_remote_code=model_args.trust_remote_code,
             num_labels=1,
             **model_kwargs,
         )
-        value_model_residual = ensure_score(resize_if_needed(value_model_residual))
+        value_model_residual = ensure_score(resize_if_needed(value_model_residual, tokenizer))
     else:
         print("DART disabled - running standard PPO baseline")
         value_model_residual = None
     
     # Reward model
+    # This remains DeBERTa as requested
+    print(f"Loading Reward Model from {training_args.reward_model_path}")
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path,
         trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
         **model_kwargs,
     )
-    reward_model = ensure_score(resize_if_needed(reward_model))
+    # Check if we need re-tokenization (if arch differs)
+    if training_args.reward_model_path != training_args.sft_model_path:
+        print("Enabling re-tokenization for Reward Model (Policy != Reward)")
+        reward_model.needs_retokenization = True
+        reward_model.policy_tokenizer = tokenizer
+        reward_model.reward_tokenizer = reward_tokenizer
+        # Don't resize using Qwen tokenizer! Use reward_tokenizer if needed.
+        # Usually standard RM doesn't need resize unless we added tokens.
+        reward_model = resize_if_needed(reward_model, reward_tokenizer)
+    else:
+        reward_model.needs_retokenization = False
+        reward_model = ensure_score(resize_if_needed(reward_model, tokenizer))
+
+    reward_model = ensure_score(reward_model)
+    
+    # Policy model
     
     # Policy model
     policy = AutoModelForCausalLM.from_pretrained(
