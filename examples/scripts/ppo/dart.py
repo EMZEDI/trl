@@ -22,7 +22,6 @@
 # ///
 
 import os
-import shutil
 
 import torch
 from accelerate import PartialState
@@ -35,6 +34,7 @@ from transformers import (
 )
 
 from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
+import trl.experimental.utils
 import trl.experimental.ppo.ppo_trainer
 from trl.experimental.ppo import PPOConfig, PPOTrainer
 from trl.experimental.utils import first_true_indices
@@ -43,78 +43,72 @@ from trl.experimental.utils import first_true_indices
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
-# Monkey-patch get_reward to handle mismatched tokenizers (Qwen Policy vs DeBERTa Reward)
-original_get_reward = trl.experimental.ppo.ppo_trainer.get_reward
+# Monkey-patch get_reward to handle mismatched tokenizers (e.g. Qwen Policy + DeBERTa Reward).
+# We patch BOTH the source module and the importing module to ensure the override is active
+# regardless of how get_reward is resolved at call time.
+_original_get_reward = trl.experimental.utils.get_reward
 
-def custom_get_reward(model, query_responses, pad_token_id, context_length):
-    # Check if this is the reward model requiring re-tokenization
-    if getattr(model, "needs_retokenization", False):
-        # query_responses contains Policy (Qwen) token IDs
-        # We must:
-        # 1. Decode back to text
-        # 2. Re-encode using Reward (DeBERTa) tokenizer
-        # 3. specific forward pass to get scalar reward
-        
-        # Access tokenizers attached to the model
-        policy_tokenizer = model.policy_tokenizer
-        reward_tokenizer = model.reward_tokenizer
-        device = query_responses.device
-        
-        # 1. Decode
-        texts = policy_tokenizer.batch_decode(query_responses, skip_special_tokens=True)
-        
-        # 2. Encode (Ensure we don't exceed model limits e.g. 512)
-        # We generally expect the reward model to have a max_position_embeddings config
-        max_len = getattr(model.config, "max_position_embeddings", 512)
-        
-        encoded = reward_tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=max_len,
-            return_tensors="pt",
-        ).to(device)
-        
-        # 3. Run Forward Pass
-        # We cannot use model.score(hidden_states) based flow easily because we don't have hidden states of Qwen input.
-        # We run the full model forward on new inputs.
-        with torch.no_grad():
-            outputs = model(
-                input_ids=encoded["input_ids"],
-                attention_mask=encoded["attention_mask"],
-                return_dict=True
-            )
-            # Depending on model type (SeqClass), logits should be (batch, 1) or (batch, num_labels)
-            # We assume it's set up as 1 label regression
-            scores = outputs.logits # (batch, 1)
 
-        # 4. Map scalar scores back to the sequence timeline for PPO
-        # PPO expects `reward_logits` of shape (batch, seq_len, 1) usually,
-        # where the last non-pad token holds the reward score.
-        
-        batch_size, seq_len = query_responses.shape
-        # Create a tensor of zeros/neutral value
-        dummy_logits = torch.zeros(batch_size, seq_len, 1, device=device, dtype=scores.dtype)
-        
-        # Find the end of the sequence in the POLICY's timeline
-        # (This aligns the reward with the end of generation)
-        seq_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-        
-        final_rewards = scores.squeeze(-1) # (batch,)
-        
-        for i in range(batch_size):
-            # Clamp index to be safe
-            idx = min(seq_lengths[i], seq_len - 1)
-            dummy_logits[i, idx, 0] = final_rewards[i]
-            
-        return dummy_logits, final_rewards, seq_lengths
-    
-    else:
-        # Fallback to standard behavior for Value Model (Qwen) and Ref Model
-        return original_get_reward(model, query_responses, pad_token_id, context_length)
+def _cross_arch_get_reward(model, query_responses, pad_token_id, context_length):
+    """Drop-in replacement for get_reward that handles cross-architecture reward models.
 
-# Apply the patch
-trl.experimental.ppo.ppo_trainer.get_reward = custom_get_reward
+    When the reward model uses a different tokenizer/architecture than the policy, the standard
+    get_reward (which feeds policy token IDs directly into the reward backbone) would crash.
+    This wrapper detects that situation via a ``needs_retokenization`` flag on the model,
+    decodes back to text, re-encodes with the reward tokenizer, and runs a full forward pass.
+    """
+    if not getattr(model, "needs_retokenization", False):
+        return _original_get_reward(model, query_responses, pad_token_id, context_length)
+
+    # --- Cross-architecture path ---
+    policy_tokenizer = model.policy_tokenizer
+    reward_tokenizer = model.reward_tokenizer
+    device = query_responses.device
+
+    # 1. Decode policy token IDs → text
+    texts = policy_tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+
+    # 2. Re-encode with the reward model's tokenizer
+    max_len = getattr(model.config, "max_position_embeddings", 512)
+    encoded = reward_tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt",
+    ).to(device)
+
+    # 3. Full forward pass through the reward model
+    with torch.no_grad():
+        outputs = model(
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            return_dict=True,
+        )
+        scores = outputs.logits  # (batch, num_labels) — typically (batch, 1)
+
+    # 4. Map the scalar reward back onto the policy's sequence timeline so PPO
+    #    can attribute the reward to the last generated token.
+    batch_size, seq_len = query_responses.shape
+    dummy_logits = torch.zeros(batch_size, seq_len, 1, device=device, dtype=scores.dtype)
+
+    seq_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
+    # Clamp to valid range to prevent index-out-of-bounds
+    seq_lengths = seq_lengths.clamp(min=context_length, max=seq_len - 1)
+
+    final_rewards = scores.squeeze(-1)  # (batch,) or (batch, 1) → (batch,)
+    if final_rewards.dim() > 1:
+        final_rewards = final_rewards[:, 0]
+
+    for i in range(batch_size):
+        dummy_logits[i, seq_lengths[i], 0] = final_rewards[i]
+
+    return dummy_logits, final_rewards, seq_lengths
+
+
+# Apply the patch to BOTH modules so every call-site (local name or qualified) is covered.
+trl.experimental.utils.get_reward = _cross_arch_get_reward
+trl.experimental.ppo.ppo_trainer.get_reward = _cross_arch_get_reward
 
 
 """
@@ -122,6 +116,22 @@ DART (Dual Adaptive Residual Tracking) Training Script
 =======================================================
 
 This script demonstrates DART training with LoRA on SFT'd models.
+
+DART extends PPO with a *residual critic*: a lightweight second value head that
+captures long-horizon value that the base critic misses.  During a configurable
+warmup phase only the base critic is active (identical to standard PPO); once
+warmup completes, the residual critic is activated with a higher GAE λ and its
+own (typically lower) learning rate, and the combined value V = V_base + V_res
+is used for advantage computation.
+
+Recommended reward models (decoder-based, works natively with TRL's get_reward):
+  - sfairXC/FsfairX-LLaMA3-RM-v0.1      (8B, general-purpose, solid)
+  - Skywork/Skywork-Reward-Llama-3.1-8B  (8B, strong)
+  - weqweasdas/RM-Gemma-2B               (2B, lightweight — good for dry-runs)
+  - RLHFlow/ArmoRM-Llama3-8B-v0.1        (8B, high quality)
+
+Cross-architecture reward models (e.g. DeBERTa) are supported via automatic
+re-tokenization, but decoder-based RMs avoid that overhead entirely.
 
 Basic usage (single GPU):
 python examples/scripts/ppo/dart.py \
@@ -181,9 +191,6 @@ if __name__ == "__main__":
     # Enable DART by default (can be disabled via --dart_enabled false for baseline comparison)
     if not hasattr(training_args, 'dart_enabled') or training_args.dart_enabled is None:
         training_args.dart_enabled = True
-    
-    # remove output_dir if exists
-    shutil.rmtree(training_args.output_dir, ignore_errors=True)
 
     # Helper: add a .score method for models that only expose a classifier head
     def ensure_score(model):
@@ -292,8 +299,6 @@ if __name__ == "__main__":
         reward_model = ensure_score(resize_if_needed(reward_model, tokenizer))
 
     reward_model = ensure_score(reward_model)
-    
-    # Policy model
     
     # Policy model
     policy = AutoModelForCausalLM.from_pretrained(

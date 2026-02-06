@@ -910,18 +910,18 @@ class PPOTrainer(BaseTrainer):
                             mb_values = values[micro_batch_inds]
                             mb_values_base = values_base[micro_batch_inds]
 
-                            # Forward pass through model
-                            policy_output = forward(model.policy, mb_query_responses, processing_class.pad_token_id)
-                            logits = policy_output.logits[:, context_length - 1 : -1]
+                            # Single forward pass through the accelerate-wrapped model
+                            # PolicyAndValueWrapper returns (policy_output, logits_base, logits_residual)
+                            output, vpred_base_temp, vpred_res_temp = forward(
+                                model, mb_query_responses, processing_class.pad_token_id
+                            )
+                            logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            
-                            # Get base critic prediction
-                            critic_output = forward(model.value_model, mb_query_responses, processing_class.pad_token_id)
-                            vpred_base = model.value_model.score(critic_output.hidden_states[-1])[:, context_length - 1 : -1].squeeze(-1)
+                            vpred_base = vpred_base_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred_base = torch.masked_fill(vpred_base, padding_mask_p1[micro_batch_inds], 0)
                             
                             # Base critic loss
@@ -949,33 +949,34 @@ class PPOTrainer(BaseTrainer):
                             # Combined loss for base optimizer (policy + base critic)
                             loss_base = pg_loss + args.vf_coef * vf_loss_base
                             
-                            # DART: Residual critic loss (if active)
+                            # DART: Residual critic loss
                             if args.dart_enabled and is_residual_active:
                                 mb_return_res = returns_residual[micro_batch_inds]
-                                critic_res_output = forward(model.value_model_residual, mb_query_responses, processing_class.pad_token_id)
-                                vpred_res = model.value_model_residual.score(critic_res_output.hidden_states[-1])[:, context_length - 1 : -1].squeeze(-1)
+                                vpred_res = vpred_res_temp[:, context_length - 1 : -1].squeeze(-1)
                                 vpred_res = torch.masked_fill(vpred_res, padding_mask_p1[micro_batch_inds], 0)
-                                
-                                # Residual target: (returns_res - base_values.detach())
+                                # Residual target: high-lambda returns minus base predictions
                                 residual_target = mb_return_res - mb_values_base.detach()
-                                vf_loss_res = 0.5 * masked_mean((vpred_res - residual_target) ** 2, ~padding_mask_p1[micro_batch_inds])
+                                vf_loss_res = 0.5 * masked_mean(
+                                    (vpred_res - residual_target) ** 2, ~padding_mask_p1[micro_batch_inds]
+                                )
+                            elif args.dart_enabled and vpred_res_temp is not None:
+                                # Warmup phase: dummy loss so DDP doesn't complain about unused residual params
+                                vf_loss_res = 0.0 * vpred_res_temp.sum()
                             else:
                                 vf_loss_res = torch.tensor(0.0, device=device)
                             
-                            # Backward pass for base optimizer
-                            accelerator.backward(loss_base)
+                            # Single backward pass for all losses
+                            total_loss = loss_base + vf_loss_res
+                            accelerator.backward(total_loss)
                             if args.dart_enabled and hasattr(self, 'optimizer_base'):
                                 self.optimizer_base.step()
                                 self.optimizer_base.zero_grad()
+                                if is_residual_active:
+                                    self.optimizer_res.step()
+                                    self.optimizer_res.zero_grad()
                             else:
                                 optimizer.step()
                                 optimizer.zero_grad()
-                            
-                            # Backward pass for residual optimizer (only if active)
-                            if args.dart_enabled and is_residual_active and hasattr(self, 'optimizer_res'):
-                                accelerator.backward(vf_loss_res)
-                                self.optimizer_res.step()
-                                self.optimizer_res.zero_grad()
                             
                             with torch.no_grad():
                                 pg_clipfrac = masked_mean(
@@ -1000,13 +1001,15 @@ class PPOTrainer(BaseTrainer):
                     # del everything and empty cache
                     # fmt: off
                     del (
-                        policy_output, critic_output, logits, new_logprobs, vpred_base, vpredclipped_base,
-                        vf_losses1_base, vf_losses2_base, vf_loss_base, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
-                        pg_loss, loss_base, pg_clipfrac, prob_dist, entropy, approxkl, mb_return_base,
-                        mb_advantage, mb_values, mb_values_base, mb_responses, mb_query_responses, mb_logprobs,
+                        output, vpred_base_temp, vpred_res_temp, logits, new_logprobs, vpred_base,
+                        vpredclipped_base, vf_losses1_base, vf_losses2_base, vf_loss_base, vf_clipfrac,
+                        logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
+                        pg_loss, loss_base, total_loss, vf_loss_res, pg_clipfrac, prob_dist, entropy,
+                        approxkl, mb_return_base, mb_advantage, mb_values, mb_values_base,
+                        mb_responses, mb_query_responses, mb_logprobs,
                     )
                     if args.dart_enabled and is_residual_active:
-                        del (critic_res_output, vpred_res, residual_target, vf_loss_res, mb_return_res)
+                        del (vpred_res, residual_target, mb_return_res)
                     # fmt: on
                     empty_cache()
             with torch.no_grad():
