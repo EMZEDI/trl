@@ -275,26 +275,17 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = T
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
-    def __init__(self, policy, value_model, value_model_residual=None) -> None:
+    def __init__(self, policy, value_model) -> None:
         super().__init__()
         self.policy = policy
         self.value_model = value_model
-        self.value_model_residual = value_model_residual
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
-        if value_model_residual is not None:
-            self.critic_backbone_residual = getattr(value_model_residual, value_model_residual.base_model_prefix)
         self.is_gradient_checkpointing = policy.is_gradient_checkpointing
 
     def forward(self, **kwargs):
         output = self.critic_backbone(**kwargs)
-        logits_base = self.value_model.score(output.hidden_states[-1])
-        
-        if self.value_model_residual is not None:
-            output_res = self.critic_backbone_residual(**kwargs)
-            logits_residual = self.value_model_residual.score(output_res.hidden_states[-1])
-            return self.policy(**kwargs), logits_base, logits_residual
-        
-        return self.policy(**kwargs), logits_base, None
+        logits = self.value_model.score(output.hidden_states[-1])
+        return self.policy(**kwargs), logits
 
 
 class PPOTrainer(BaseTrainer):
@@ -489,7 +480,7 @@ class PPOTrainer(BaseTrainer):
         for module in [self.policy_model, self.ref_model, self.value_model, self.value_model_residual, self.reward_model]:
             if module is not None:
                 disable_dropout_in_model(module)
-        self.model = PolicyAndValueWrapper(self.policy_model, self.value_model, self.value_model_residual)
+        self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         
         # DART: compute warmup steps
@@ -578,9 +569,16 @@ class PPOTrainer(BaseTrainer):
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
         if args.dart_enabled and hasattr(self, 'optimizer_base'):
-            # DART: Prepare model and both optimizers
-            self.model, self.optimizer_base, self.optimizer_res, self.dataloader = accelerator.prepare(
-                self.model, self.optimizer_base, self.optimizer_res, self.dataloader
+            # DART: Prepare model, residual model, both optimizers, and dataloader.
+            # The residual is prepared separately (not inside the wrapper) so that its
+            # forward/backward can run sequentially after the policy+base_critic pass,
+            # keeping peak activation memory at ~2 models instead of 3.
+            (
+                self.model, self.value_model_residual,
+                self.optimizer_base, self.optimizer_res, self.dataloader,
+            ) = accelerator.prepare(
+                self.model, self.value_model_residual,
+                self.optimizer_base, self.optimizer_res, self.dataloader,
             )
             self.optimizer = self.optimizer_base  # For compatibility
         else:
@@ -789,7 +787,7 @@ class PPOTrainer(BaseTrainer):
                     value_base = full_value_base[:, context_length - 1 : -1].squeeze(-1)
                     
                     if args.dart_enabled:
-                        unwrapped_value_model_res = accelerator.unwrap_model(model).value_model_residual
+                        unwrapped_value_model_res = accelerator.unwrap_model(self.value_model_residual)
                         full_value_res, _, _ = get_reward(
                             unwrapped_value_model_res, query_response, processing_class.pad_token_id, context_length
                         )
@@ -910,9 +908,8 @@ class PPOTrainer(BaseTrainer):
                             mb_values = values[micro_batch_inds]
                             mb_values_base = values_base[micro_batch_inds]
 
-                            # Single forward pass through the accelerate-wrapped model
-                            # PolicyAndValueWrapper returns (policy_output, logits_base, logits_residual)
-                            output, vpred_base_temp, vpred_res_temp = forward(
+                            # ── Phase 1: policy + base critic (through the wrapper) ──
+                            output, vpred_base_temp = forward(
                                 model, mb_query_responses, processing_class.pad_token_id
                             )
                             logits = output.logits[:, context_length - 1 : -1]
@@ -923,8 +920,8 @@ class PPOTrainer(BaseTrainer):
                             )
                             vpred_base = vpred_base_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred_base = torch.masked_fill(vpred_base, padding_mask_p1[micro_batch_inds], 0)
-                            
-                            # Base critic loss
+
+                            # Base critic loss (clipped)
                             vpredclipped_base = torch.clamp(
                                 vpred_base,
                                 mb_values_base - args.cliprange_value,
@@ -937,47 +934,16 @@ class PPOTrainer(BaseTrainer):
                             vf_clipfrac = masked_mean(
                                 (vf_losses2_base > vf_losses1_base).float(), ~padding_mask_p1[micro_batch_inds]
                             )
-                            
-                            # Policy loss
+
+                            # Policy loss (clipped)
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
                             pg_losses = -mb_advantage * ratio
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
-                            
-                            # Combined loss for base optimizer (policy + base critic)
-                            loss_base = pg_loss + args.vf_coef * vf_loss_base
-                            
-                            # DART: Residual critic loss
-                            if args.dart_enabled and is_residual_active:
-                                mb_return_res = returns_residual[micro_batch_inds]
-                                vpred_res = vpred_res_temp[:, context_length - 1 : -1].squeeze(-1)
-                                vpred_res = torch.masked_fill(vpred_res, padding_mask_p1[micro_batch_inds], 0)
-                                # Residual target: high-lambda returns minus base predictions
-                                residual_target = mb_return_res - mb_values_base.detach()
-                                vf_loss_res = 0.5 * masked_mean(
-                                    (vpred_res - residual_target) ** 2, ~padding_mask_p1[micro_batch_inds]
-                                )
-                            elif args.dart_enabled and vpred_res_temp is not None:
-                                # Warmup phase: dummy loss so DDP doesn't complain about unused residual params
-                                vf_loss_res = 0.0 * vpred_res_temp.sum()
-                            else:
-                                vf_loss_res = torch.tensor(0.0, device=device)
-                            
-                            # Single backward pass for all losses
-                            total_loss = loss_base + vf_loss_res
-                            accelerator.backward(total_loss)
-                            if args.dart_enabled and hasattr(self, 'optimizer_base'):
-                                self.optimizer_base.step()
-                                self.optimizer_base.zero_grad()
-                                if is_residual_active:
-                                    self.optimizer_res.step()
-                                    self.optimizer_res.zero_grad()
-                            else:
-                                optimizer.step()
-                                optimizer.zero_grad()
-                            
+
+                            # Collect stats before backward frees the graph
                             with torch.no_grad():
                                 pg_clipfrac = masked_mean(
                                     (pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds]
@@ -996,22 +962,57 @@ class PPOTrainer(BaseTrainer):
                                 )
                                 entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                                 ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
+
+                            # Backward + step for policy + base critic
+                            loss_base = pg_loss + args.vf_coef * vf_loss_base
+                            accelerator.backward(loss_base)
+                            if args.dart_enabled and hasattr(self, 'optimizer_base'):
+                                self.optimizer_base.step()
+                                self.optimizer_base.zero_grad()
+                            else:
+                                optimizer.step()
+                                optimizer.zero_grad()
+
+                            # Free policy + base critic activations before residual forward
+                            # fmt: off
+                            del (
+                                output, vpred_base_temp, logits, new_logprobs, vpred_base,
+                                vpredclipped_base, vf_losses1_base, vf_losses2_base, vf_loss_base,
+                                vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2,
+                                pg_loss_max, pg_loss, loss_base, pg_clipfrac, prob_dist,
+                                entropy, approxkl, mb_return_base,
+                            )
+                            # fmt: on
+                            empty_cache()
+
+                            # ── Phase 2: DART residual critic (separate model, sequential) ──
+                            if args.dart_enabled and is_residual_active:
+                                mb_return_res = returns_residual[micro_batch_inds]
+                                # Forward through the separately-prepared residual model
+                                res_output = forward(
+                                    self.value_model_residual, mb_query_responses,
+                                    processing_class.pad_token_id,
+                                )
+                                unwrapped_res = accelerator.unwrap_model(self.value_model_residual)
+                                vpred_res = unwrapped_res.score(
+                                    res_output.hidden_states[-1]
+                                )[:, context_length - 1 : -1].squeeze(-1)
+                                vpred_res = torch.masked_fill(vpred_res, padding_mask_p1[micro_batch_inds], 0)
+                                # Residual target: high-lambda returns minus base value predictions
+                                residual_target = mb_return_res - mb_values_base.detach()
+                                vf_loss_res = 0.5 * masked_mean(
+                                    (vpred_res - residual_target) ** 2,
+                                    ~padding_mask_p1[micro_batch_inds],
+                                )
+                                accelerator.backward(vf_loss_res)
+                                self.optimizer_res.step()
+                                self.optimizer_res.zero_grad()
+                                del res_output, vpred_res, residual_target, vf_loss_res, mb_return_res
+                                empty_cache()
+
+                            del mb_advantage, mb_values, mb_values_base, mb_responses, mb_query_responses, mb_logprobs
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
-                    # del everything and empty cache
-                    # fmt: off
-                    del (
-                        output, vpred_base_temp, vpred_res_temp, logits, new_logprobs, vpred_base,
-                        vpredclipped_base, vf_losses1_base, vf_losses2_base, vf_loss_base, vf_clipfrac,
-                        logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
-                        pg_loss, loss_base, total_loss, vf_loss_res, pg_clipfrac, prob_dist, entropy,
-                        approxkl, mb_return_base, mb_advantage, mb_values, mb_values_base,
-                        mb_responses, mb_query_responses, mb_logprobs,
-                    )
-                    if args.dart_enabled and is_residual_active:
-                        del (vpred_res, residual_target, mb_return_res)
-                    # fmt: on
-                    empty_cache()
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
