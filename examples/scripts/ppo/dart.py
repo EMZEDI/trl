@@ -122,6 +122,17 @@ if __name__ == "__main__":
             model.score = score
         return model
 
+    def resize_if_needed(model):
+        if model is None:
+            return model
+        try:
+            emb = model.get_input_embeddings()
+            if emb is not None and emb.num_embeddings != len(tokenizer):
+                model.resize_token_embeddings(len(tokenizer))
+        except Exception:
+            pass
+        return model
+
     ################
     # Model & Tokenizer
     ################
@@ -149,7 +160,7 @@ if __name__ == "__main__":
         num_labels=1,
         **model_kwargs,
     )
-    value_model = ensure_score(value_model)
+    value_model = ensure_score(resize_if_needed(value_model))
     
     # DART: Create residual value model (only if DART is enabled)
     if training_args.dart_enabled:
@@ -165,7 +176,7 @@ if __name__ == "__main__":
             num_labels=1,
             **model_kwargs,
         )
-        value_model_residual = ensure_score(value_model_residual)
+        value_model_residual = ensure_score(resize_if_needed(value_model_residual))
     else:
         print("DART disabled - running standard PPO baseline")
         value_model_residual = None
@@ -177,18 +188,20 @@ if __name__ == "__main__":
         num_labels=1,
         **model_kwargs,
     )
-    reward_model = ensure_score(reward_model)
+    reward_model = ensure_score(resize_if_needed(reward_model))
     
     # Policy model
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
+    policy = resize_if_needed(policy)
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_policy = AutoModelForCausalLM.from_pretrained(
             training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
         )
+        ref_policy = resize_if_needed(ref_policy)
     else:
         ref_policy = None
 
