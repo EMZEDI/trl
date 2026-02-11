@@ -176,6 +176,7 @@ if __name__ == "__main__":
         num_labels=1,
         **model_kwargs,
     )
+    value_model.config.pad_token_id = tokenizer.pad_token_id
 
     # ── DART: Residual value model ───────────────────────────────────────────
     if training_args.dart_enabled:
@@ -190,6 +191,8 @@ if __name__ == "__main__":
                 num_labels=1,
                 **model_kwargs,
             )
+        # Set pad_token_id so GPT-NeoX forward doesn't crash with batch > 1
+        value_model_residual.config.pad_token_id = tokenizer.pad_token_id
     else:
         print("DART disabled - running standard PPO baseline")
         value_model_residual = None
@@ -203,6 +206,7 @@ if __name__ == "__main__":
             num_labels=1,
             **model_kwargs,
         )
+    reward_model.config.pad_token_id = tokenizer.pad_token_id
 
     # ── Policy model ─────────────────────────────────────────────────────────
     policy = AutoModelForCausalLM.from_pretrained(

@@ -502,15 +502,19 @@ class PPOTrainer(BaseTrainer):
         # The residual model will get its own DeepSpeed engine via deepspeed.initialize().
         if args.dart_enabled and optimizers == (None, None):
             # Base optimizer: actor + base critic — only TRAINABLE params (critical for LoRA)
+            # Use args.weight_decay (default 0.0) to match create_optimizer_and_scheduler behavior
             base_params = [p for p in self.policy_model.parameters() if p.requires_grad] + \
                           [p for p in self.value_model.parameters() if p.requires_grad]
-            self.optimizer = torch.optim.AdamW(base_params, lr=args.learning_rate, eps=1e-5)
+            self.optimizer = torch.optim.AdamW(
+                base_params, lr=args.learning_rate, eps=args.adam_epsilon, weight_decay=args.weight_decay
+            )
 
             # Residual optimizer: residual critic only (will be prepared separately)
             self.optimizer_res = torch.optim.AdamW(
                 [p for p in self.value_model_residual.parameters() if p.requires_grad],
                 lr=args.learning_rate * args.dart_lr_scale,
-                eps=1e-5,
+                eps=args.adam_epsilon,
+                weight_decay=args.weight_decay,
             )
 
             from transformers.optimization import get_scheduler
@@ -617,7 +621,7 @@ class PPOTrainer(BaseTrainer):
                     "type": "AdamW",
                     "params": {
                         "lr": args.learning_rate * args.dart_lr_scale,
-                        "eps": 1e-5,
+                        "eps": args.adam_epsilon,
                     },
                 }
                 ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size

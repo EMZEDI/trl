@@ -39,7 +39,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --stop_token eos \
     --kl_coef 0.05 \
     --dart_enabled true \
-    --dart_warmup_frac 0.15 \
+    --dart_warmup_frac 0.4 \
     --eval_strategy steps \
     --eval_steps 200 \
     --report_to wandb \
