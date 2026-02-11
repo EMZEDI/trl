@@ -34,88 +34,36 @@ from transformers import (
 )
 
 from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
-import trl.experimental.utils
-import trl.experimental.ppo.ppo_trainer
 from trl.experimental.ppo import PPOConfig, PPOTrainer
-from trl.experimental.utils import first_true_indices
+
+
+def _no_zero3_init():
+    """Context manager that temporarily pauses DeepSpeed Zero3 Init if active.
+
+    Models loaded inside this context will NOT be sharded during from_pretrained.
+    Use for models that will be prepared separately later (reward, ref, residual).
+    Uses Accelerate's official API to toggle the zero3_init_flag.
+    """
+    from contextlib import nullcontext
+    try:
+        from accelerate import PartialState
+        state = PartialState()
+        ds_plugin = getattr(state, "deepspeed_plugin", None)
+        if ds_plugin is not None and getattr(ds_plugin, "is_zero3_init_enabled", lambda: False)():
+            return ds_plugin.zero3_init_context_manager(enable=False)
+    except Exception:
+        pass
+    return nullcontext()
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
-
-# Monkey-patch get_reward to handle mismatched tokenizers (e.g. Qwen Policy + DeBERTa Reward).
-# We patch BOTH the source module and the importing module to ensure the override is active
-# regardless of how get_reward is resolved at call time.
-_original_get_reward = trl.experimental.utils.get_reward
-
-
-def _cross_arch_get_reward(model, query_responses, pad_token_id, context_length):
-    """Drop-in replacement for get_reward that handles cross-architecture reward models.
-
-    When the reward model uses a different tokenizer/architecture than the policy, the standard
-    get_reward (which feeds policy token IDs directly into the reward backbone) would crash.
-    This wrapper detects that situation via a ``needs_retokenization`` flag on the model,
-    decodes back to text, re-encodes with the reward tokenizer, and runs a full forward pass.
-    """
-    if not getattr(model, "needs_retokenization", False):
-        return _original_get_reward(model, query_responses, pad_token_id, context_length)
-
-    # --- Cross-architecture path ---
-    policy_tokenizer = model.policy_tokenizer
-    reward_tokenizer = model.reward_tokenizer
-    device = query_responses.device
-
-    # 1. Decode policy token IDs → text
-    texts = policy_tokenizer.batch_decode(query_responses, skip_special_tokens=True)
-
-    # 2. Re-encode with the reward model's tokenizer
-    max_len = getattr(model.config, "max_position_embeddings", 512)
-    encoded = reward_tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-    ).to(device)
-
-    # 3. Full forward pass through the reward model
-    with torch.no_grad():
-        outputs = model(
-            input_ids=encoded["input_ids"],
-            attention_mask=encoded["attention_mask"],
-            return_dict=True,
-        )
-        scores = outputs.logits  # (batch, num_labels) — typically (batch, 1)
-
-    # 4. Map the scalar reward back onto the policy's sequence timeline so PPO
-    #    can attribute the reward to the last generated token.
-    batch_size, seq_len = query_responses.shape
-    dummy_logits = torch.zeros(batch_size, seq_len, 1, device=device, dtype=scores.dtype)
-
-    seq_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
-    # Clamp to valid range to prevent index-out-of-bounds
-    seq_lengths = seq_lengths.clamp(min=context_length, max=seq_len - 1)
-
-    final_rewards = scores.squeeze(-1)  # (batch,) or (batch, 1) → (batch,)
-    if final_rewards.dim() > 1:
-        final_rewards = final_rewards[:, 0]
-
-    for i in range(batch_size):
-        dummy_logits[i, seq_lengths[i], 0] = final_rewards[i]
-
-    return dummy_logits, final_rewards, seq_lengths
-
-
-# Apply the patch to BOTH modules so every call-site (local name or qualified) is covered.
-trl.experimental.utils.get_reward = _cross_arch_get_reward
-trl.experimental.ppo.ppo_trainer.get_reward = _cross_arch_get_reward
 
 
 """
 DART (Dual Adaptive Residual Tracking) Training Script
 =======================================================
 
-This script demonstrates DART training with LoRA on SFT'd models.
+This script demonstrates DART training on the TL;DR summarization task.
 
 DART extends PPO with a *residual critic*: a lightweight second value head that
 captures long-horizon value that the base critic misses.  During a configurable
@@ -124,63 +72,69 @@ warmup completes, the residual critic is activated with a higher GAE λ and its
 own (typically lower) learning rate, and the combined value V = V_base + V_res
 is used for advantage computation.
 
-Recommended reward models (decoder-based, works natively with TRL's get_reward):
-  - sfairXC/FsfairX-LLaMA3-RM-v0.1      (8B, general-purpose, solid)
-  - Skywork/Skywork-Reward-Llama-3.1-8B  (8B, strong)
-  - weqweasdas/RM-Gemma-2B               (2B, lightweight — good for dry-runs)
-  - RLHFlow/ArmoRM-Llama3-8B-v0.1        (8B, high quality)
+IMPORTANT: The reward model and value model must share the same architecture as
+the policy model (same tokenizer, same backbone). The value model is loaded from
+``--reward_model_path`` so that its ``score`` head is pre-trained, not random.
 
-Cross-architecture reward models (e.g. DeBERTa) are supported via automatic
-re-tokenization, but decoder-based RMs avoid that overhead entirely.
+Recommended setup (Pythia-1B, TL;DR):
+  - Policy/SFT:   cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr
+  - Reward/Value:  cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr
+  - Dataset:       trl-lib/tldr
 
-Basic usage (single GPU):
+Single GPU — DART:
 python examples/scripts/ppo/dart.py \
-    --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style \
-    --dataset_train_split descriptiveness \
+    --dataset_name trl-lib/tldr \
+    --dataset_test_split validation \
     --learning_rate 3e-6 \
-    --output_dir pythia-1b-deduped-dart \
-    --per_device_train_batch_size 64 \
-    --gradient_accumulation_steps 1 \
-    --total_episodes 10000 \
-    --model_name_or_path EleutherAI/pythia-1b-deduped \
-    --missing_eos_penalty 1.0 \
-    --use_peft \
-    --lora_r 16 \
-    --lora_alpha 32
-
-Multi-GPU with DeepSpeed:
-accelerate launch --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
-    examples/scripts/ppo/dart.py \
-    --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style \
-    --dataset_train_split descriptiveness \
-    --output_dir pythia-1b-deduped-dart \
-    --num_ppo_epochs 1 \
-    --num_mini_batches 1 \
-    --learning_rate 3e-6 \
+    --output_dir pythia-1b-dart \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 16 \
-    --total_episodes 10000 \
+    --gradient_accumulation_steps 64 \
+    --total_episodes 30000 \
     --model_name_or_path EleutherAI/pythia-1b-deduped \
-    --sft_model_path EleutherAI/pythia-1b-deduped \
-    --reward_model_path EleutherAI/pythia-1b-deduped \
-    --local_rollout_forward_batch_size 1 \
+    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
+    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
     --missing_eos_penalty 1.0 \
-    --use_peft \
-    --lora_r 16 \
-    --lora_alpha 32
+    --stop_token eos \
+    --response_length 53 \
+    --dart_enabled true
+
+Multi-GPU with DeepSpeed — DART:
+accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+    examples/scripts/ppo/dart.py \
+    --dataset_name trl-lib/tldr \
+    --dataset_test_split validation \
+    --output_dir pythia-1b-dart \
+    --learning_rate 3e-6 \
+    --per_device_train_batch_size 16 \
+    --gradient_accumulation_steps 4 \
+    --total_episodes 100000 \
+    --model_name_or_path EleutherAI/pythia-1b-deduped \
+    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
+    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
+    --local_rollout_forward_batch_size 16 \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos \
+    --dart_enabled true \
+    --report_to wandb
 
 Compare with standard PPO (disable DART):
-python examples/scripts/ppo/dart.py \
-    --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style \
-    --dataset_train_split descriptiveness \
-    --output_dir pythia-1b-deduped-ppo-baseline \
-    --per_device_train_batch_size 64 \
-    --total_episodes 10000 \
+accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+    examples/scripts/ppo/dart.py \
+    --dataset_name trl-lib/tldr \
+    --dataset_test_split validation \
+    --output_dir pythia-1b-ppo-baseline \
+    --learning_rate 3e-6 \
+    --per_device_train_batch_size 16 \
+    --gradient_accumulation_steps 4 \
+    --total_episodes 100000 \
     --model_name_or_path EleutherAI/pythia-1b-deduped \
+    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
+    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
+    --local_rollout_forward_batch_size 16 \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos \
     --dart_enabled false \
-    --use_peft \
-    --lora_r 16 \
-    --lora_alpha 32
+    --report_to wandb
 """
 
 
@@ -191,31 +145,6 @@ if __name__ == "__main__":
     # Enable DART by default (can be disabled via --dart_enabled false for baseline comparison)
     if not hasattr(training_args, 'dart_enabled') or training_args.dart_enabled is None:
         training_args.dart_enabled = True
-
-    # Helper: add a .score method for models that only expose a classifier head
-    def ensure_score(model):
-        if hasattr(model, "score"):
-            return model
-        if hasattr(model, "classifier"):
-            def score(hidden_states):
-                pooled = hidden_states[:, 0, :] if hidden_states.dim() == 3 else hidden_states
-                logits = model.classifier(pooled)
-                return logits.unsqueeze(-1) if logits.dim() == 2 else logits
-            model.score = score
-        return model
-
-    def resize_if_needed(model, tokenizer_to_use=None):
-        if model is None:
-            return model
-        if tokenizer_to_use is None:
-            tokenizer_to_use = tokenizer
-        try:
-            emb = model.get_input_embeddings()
-            if emb is not None and emb.num_embeddings != len(tokenizer_to_use):
-                model.resize_token_embeddings(len(tokenizer_to_use))
-        except Exception:
-            pass
-        return model
 
     ################
     # Model & Tokenizer
@@ -236,111 +165,80 @@ if __name__ == "__main__":
         model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    
-    # Load Reward Tokenizer (DeBERTa) explicitly
-    if training_args.reward_model_path != training_args.sft_model_path:
-        reward_tokenizer = AutoTokenizer.from_pretrained(
-            training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code
-        )
-    else:
-        reward_tokenizer = tokenizer
 
-    # Base value model
-    # IMPORTANT: We load Value Model from SFT/Policy path (Qwen) to ensure tokenizers match for token-level updates.
-    # Using DeBERTa (Reward Model) as Value Model with a Qwen Policy causes tokenizer mismatches for the Critic.
-    print(f"Loading Value Model from {training_args.sft_model_path} (to match Policy structure)")
+    # ── Value model ──────────────────────────────────────────────────────────
+    # Load from reward_model_path so the score head is PRETRAINED (not random).
+    # This matches the official TRL ppo_tldr.py pattern.
+    print(f"Loading Value Model from {training_args.reward_model_path}")
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.sft_model_path,
-        trust_remote_code=model_args.trust_remote_code,
-        num_labels=1,
-        **model_kwargs,
-    )
-    value_model = ensure_score(resize_if_needed(value_model, tokenizer))
-    
-    # DART: Create residual value model (only if DART is enabled)
-    if training_args.dart_enabled:
-        print(f"DART enabled - creating residual value model")
-        print(f"  - dart_lambda_res: {training_args.dart_lambda_res}")
-        print(f"  - dart_lr_scale: {training_args.dart_lr_scale}")
-        print(f"  - dart_warmup_frac: {training_args.dart_warmup_frac}")
-        # TODO: this currently just creates a copy of the value model, but in practice one might want to
-        # start from a random initialization. Consider adding a flag to control this behavior.
-        value_model_residual = AutoModelForSequenceClassification.from_pretrained(
-            training_args.sft_model_path,
-            trust_remote_code=model_args.trust_remote_code,
-            num_labels=1,
-            **model_kwargs,
-        )
-        value_model_residual = ensure_score(resize_if_needed(value_model_residual, tokenizer))
-    else:
-        print("DART disabled - running standard PPO baseline")
-        value_model_residual = None
-    
-    # Reward model
-    # This remains DeBERTa as requested
-    print(f"Loading Reward Model from {training_args.reward_model_path}")
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path,
         trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
         **model_kwargs,
     )
-    # Check if we need re-tokenization (if arch differs)
-    if training_args.reward_model_path != training_args.sft_model_path:
-        print("Enabling re-tokenization for Reward Model (Policy != Reward)")
-        reward_model.needs_retokenization = True
-        reward_model.policy_tokenizer = tokenizer
-        reward_model.reward_tokenizer = reward_tokenizer
-        # Don't resize using Qwen tokenizer! Use reward_tokenizer if needed.
-        # Usually standard RM doesn't need resize unless we added tokens.
-        reward_model = resize_if_needed(reward_model, reward_tokenizer)
-    else:
-        reward_model.needs_retokenization = False
-        reward_model = ensure_score(resize_if_needed(reward_model, tokenizer))
 
-    reward_model = ensure_score(reward_model)
-    
-    # Policy model
+    # ── DART: Residual value model ───────────────────────────────────────────
+    if training_args.dart_enabled:
+        print(f"DART enabled - creating residual value model from {training_args.reward_model_path}")
+        print(f"  - dart_lambda_res: {training_args.dart_lambda_res}")
+        print(f"  - dart_lr_scale: {training_args.dart_lr_scale}")
+        print(f"  - dart_warmup_frac: {training_args.dart_warmup_frac}")
+        with _no_zero3_init():
+            value_model_residual = AutoModelForSequenceClassification.from_pretrained(
+                training_args.reward_model_path,
+                trust_remote_code=model_args.trust_remote_code,
+                num_labels=1,
+                **model_kwargs,
+            )
+    else:
+        print("DART disabled - running standard PPO baseline")
+        value_model_residual = None
+
+    # ── Reward model ─────────────────────────────────────────────────────────
+    print(f"Loading Reward Model from {training_args.reward_model_path}")
+    with _no_zero3_init():
+        reward_model = AutoModelForSequenceClassification.from_pretrained(
+            training_args.reward_model_path,
+            trust_remote_code=model_args.trust_remote_code,
+            num_labels=1,
+            **model_kwargs,
+        )
+
+    # ── Policy model ─────────────────────────────────────────────────────────
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
-    policy = resize_if_needed(policy)
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
-        ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
-        )
-        ref_policy = resize_if_needed(ref_policy)
+        with _no_zero3_init():
+            ref_policy = AutoModelForCausalLM.from_pretrained(
+                training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+            )
     else:
         ref_policy = None
 
     ################
     # Dataset
     ################
-    dataset = load_dataset(
-        script_args.dataset_name, name=script_args.dataset_config, split=script_args.dataset_train_split
-    )
-    eval_samples = 100
-    train_dataset = dataset.select(range(len(dataset) - eval_samples))
-    eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))
-    dataset_text_field = "prompt"
+    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    train_dataset = dataset[script_args.dataset_train_split]
+    eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+    if eval_dataset is None:
+        # Fallback: split off a small eval set from the end of train
+        eval_samples = 100
+        eval_dataset = train_dataset.select(range(len(train_dataset) - eval_samples, len(train_dataset)))
+        train_dataset = train_dataset.select(range(len(train_dataset) - eval_samples))
 
     def prepare_dataset(dataset, tokenizer):
         """pre-tokenize the dataset before training; only collate during training"""
 
         def tokenize(element):
-            outputs = tokenizer(
-                element[dataset_text_field],
-                padding=False,
-                truncation=True,
-                max_length=512 - training_args.response_length,
-            )
-            return {"input_ids": outputs["input_ids"]}
+            input_ids = tokenizer(element["prompt"], padding=False)["input_ids"]
+            return {"input_ids": input_ids, "lengths": len(input_ids)}
 
         return dataset.map(
             tokenize,
-            batched=True,
             remove_columns=dataset.column_names,
             num_proc=training_args.dataset_num_proc,
         )
@@ -349,7 +247,12 @@ if __name__ == "__main__":
     # see: https://github.com/huggingface/trl/pull/1255
     with PartialState().local_main_process_first():
         train_dataset = prepare_dataset(train_dataset, tokenizer)
-        eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+        if eval_dataset is not None:
+            eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+        # Filter out prompts that are too long
+        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        if eval_dataset is not None:
+            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
 
     ################
     # Training

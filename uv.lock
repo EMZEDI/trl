@@ -5372,6 +5372,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
+    { name = "deepspeed" },
     { name = "packaging" },
     { name = "peft" },
     { name = "transformers" },
@@ -5463,6 +5464,7 @@ requires-dist = [
     { name = "bitsandbytes", marker = "extra == 'dev'" },
     { name = "bitsandbytes", marker = "extra == 'quantization'" },
     { name = "datasets", specifier = ">=3.0.0" },
+    { name = "deepspeed", specifier = ">=0.18.5" },
     { name = "deepspeed", marker = "extra == 'deepspeed'", specifier = ">=0.14.4" },
     { name = "deepspeed", marker = "extra == 'dev'", specifier = ">=0.14.4" },
     { name = "fastapi", marker = "extra == 'vllm'" },

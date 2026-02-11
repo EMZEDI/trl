@@ -194,6 +194,7 @@ def forward(
     model: torch.nn.Module,
     query_responses: torch.Tensor,
     pad_token_id: int,
+    **forward_kwargs,
 ) -> ModelOutput:
     """
     Performs a forward pass through the model with the given query responses and pad token ID.
@@ -213,12 +214,18 @@ def forward(
     attention_mask = query_responses != pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    is_wrapper = (hasattr(model, "policy") and hasattr(model, "value_model")) or (
+        hasattr(model, "module") and hasattr(model.module, "policy") and hasattr(model.module, "value_model")
+    )
+    if forward_kwargs and not is_wrapper:
+        forward_kwargs = {}
     return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
+        **forward_kwargs,
     )
 
 
@@ -450,6 +457,8 @@ class PPOTrainer(BaseTrainer):
             args.total_episodes = int(args.num_train_epochs * self.train_dataset_len)
         accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
         self.accelerator = accelerator
+        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
         args.world_size = accelerator.num_processes
         args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
@@ -480,6 +489,8 @@ class PPOTrainer(BaseTrainer):
         for module in [self.policy_model, self.ref_model, self.value_model, self.value_model_residual, self.reward_model]:
             if module is not None:
                 disable_dropout_in_model(module)
+        # Only wrap policy + base value model. The residual model is kept separate
+        # to avoid creating an oversized DeepSpeed engine (which causes NCCL hangs).
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         
@@ -487,24 +498,25 @@ class PPOTrainer(BaseTrainer):
         if args.dart_enabled:
             self.warmup_steps = int(args.total_episodes * args.dart_warmup_frac)
         
-        # DART: Create separate optimizers if enabled and no custom optimizers provided
+        # DART: Always use separate optimizers for base and residual, even with DeepSpeed.
+        # The residual model will get its own DeepSpeed engine via deepspeed.initialize().
         if args.dart_enabled and optimizers == (None, None):
-            # Base optimizer: actor + base critic
+            # Base optimizer: actor + base critic (will be wrapped by accelerator.prepare)
             base_params = list(self.policy_model.parameters()) + list(self.value_model.parameters())
-            self.optimizer_base = torch.optim.AdamW(base_params, lr=args.learning_rate, eps=1e-5)
-            
-            # Residual optimizer: residual critic only
+            self.optimizer = torch.optim.AdamW(base_params, lr=args.learning_rate, eps=1e-5)
+
+            # Residual optimizer: residual critic only (will be prepared separately)
             self.optimizer_res = torch.optim.AdamW(
                 self.value_model_residual.parameters(),
                 lr=args.learning_rate * args.dart_lr_scale,
                 eps=1e-5,
             )
-            
-            # Create schedulers for both optimizers
+
             from transformers.optimization import get_scheduler
-            self.lr_scheduler_base = get_scheduler(
+
+            self.lr_scheduler = get_scheduler(
                 name=args.lr_scheduler_type,
-                optimizer=self.optimizer_base,
+                optimizer=self.optimizer,
                 num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
                 num_training_steps=args.num_total_batches,
             )
@@ -514,10 +526,6 @@ class PPOTrainer(BaseTrainer):
                 num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
                 num_training_steps=args.num_total_batches,
             )
-            
-            # For compatibility, set the base optimizer as the default
-            self.optimizer = self.optimizer_base
-            self.lr_scheduler = self.lr_scheduler_base
         else:
             self.create_optimizer_and_scheduler(
                 num_training_steps=args.num_total_batches
@@ -542,8 +550,7 @@ class PPOTrainer(BaseTrainer):
         )
         self.current_flos = 0
         self.hp_search_backend = None
-        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        # self.is_deepspeed_enabled and self.is_fsdp_enabled are already set earlier
         # Create distant repo and output directory if needed
         self.hub_model_id = None
         if self.args.push_to_hub:
@@ -568,21 +575,11 @@ class PPOTrainer(BaseTrainer):
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
-        if args.dart_enabled and hasattr(self, 'optimizer_base'):
-            # DART: Prepare model, residual model, both optimizers, and dataloader.
-            # The residual is prepared separately (not inside the wrapper) so that its
-            # forward/backward can run sequentially after the policy+base_critic pass,
-            # keeping peak activation memory at ~2 models instead of 3.
-            (
-                self.model, self.value_model_residual,
-                self.optimizer_base, self.optimizer_res, self.dataloader,
-            ) = accelerator.prepare(
-                self.model, self.value_model_residual,
-                self.optimizer_base, self.optimizer_res, self.dataloader,
-            )
-            self.optimizer = self.optimizer_base  # For compatibility
-        else:
-            self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        # Always prepare just the (policy+base_value) wrapper, one optimizer, and the dataloader.
+        # The residual model is handled separately below to avoid an oversized DeepSpeed engine.
+        self.model, self.optimizer, self.dataloader = accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
         self.eval_dataloader = DataLoader(
@@ -605,6 +602,42 @@ class PPOTrainer(BaseTrainer):
                 self.ref_model = prepare_deepspeed(
                     self.ref_model, args.per_device_train_batch_size, args.fp16, args.bf16
                 )
+
+            # DART: Create a separate DeepSpeed engine for the residual model.
+            # This avoids putting 3 models in one engine (which causes NCCL hangs).
+            if args.dart_enabled and self.value_model_residual is not None:
+                import deepspeed
+                from copy import deepcopy
+
+                ds_plugin = self.accelerator.state.deepspeed_plugin
+                ds_config = deepcopy(ds_plugin.deepspeed_config)
+                # Use the residual-specific learning rate
+                ds_config["optimizer"] = {
+                    "type": "AdamW",
+                    "params": {
+                        "lr": args.learning_rate * args.dart_lr_scale,
+                        "eps": 1e-5,
+                    },
+                }
+                ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
+                ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+                world_size = self.accelerator.num_processes
+                ds_config["train_batch_size"] = (
+                    args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size
+                )
+                # Ensure the residual model's hidden size is used for Zero3 bucket sizing
+                hidden_size = getattr(self.value_model_residual.config, "hidden_size", None)
+                if hidden_size is not None and ds_config.get("zero_optimization", {}).get("stage") == 3:
+                    ds_config.setdefault("zero_optimization", {})
+                    ds_config["zero_optimization"]["reduce_bucket_size"] = hidden_size * hidden_size
+                    ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 10 * hidden_size
+                    ds_config["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
+                self.value_model_residual, self.optimizer_res, _, self.lr_scheduler_res = deepspeed.initialize(
+                    model=self.value_model_residual,
+                    optimizer=self.optimizer_res,
+                    lr_scheduler=self.lr_scheduler_res,
+                    config=ds_config,
+                )
         else:
             if self.ref_model is None:
                 if not self.is_peft_model:
@@ -612,6 +645,10 @@ class PPOTrainer(BaseTrainer):
             else:
                 self.ref_model = self.ref_model.to(self.accelerator.device)
             self.reward_model = self.reward_model.to(self.accelerator.device)
+
+            # DART: Prepare the residual model separately for non-DeepSpeed
+            if args.dart_enabled and self.value_model_residual is not None:
+                self.value_model_residual = self.value_model_residual.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -637,16 +674,15 @@ class PPOTrainer(BaseTrainer):
         backup_model = self.model
         self.model = self.model.policy  # save only the policy
 
-        if self.is_deepspeed_enabled:
-            backup_deepspeed = self.deepspeed
-            self.deepspeed = self.model
+        # NOTE: we intentionally do NOT swap self.deepspeed here.
+        # self.deepspeed is the DeepSpeed engine (set in train()), and the
+        # parent Trainer.save_model() calls self.deepspeed.config.get(...)
+        # expecting a dict.  Replacing it with the raw policy model would
+        # make .config a HuggingFace PretrainedConfig and crash.
 
         super().save_model(output_dir, _internal_call)
 
         self.model = backup_model
-
-        if self.is_deepspeed_enabled:
-            self.deepspeed = backup_deepspeed
 
     def train(self):
         args = self.args
@@ -787,7 +823,10 @@ class PPOTrainer(BaseTrainer):
                     value_base = full_value_base[:, context_length - 1 : -1].squeeze(-1)
                     
                     if args.dart_enabled:
-                        unwrapped_value_model_res = accelerator.unwrap_model(self.value_model_residual)
+                        if self.is_deepspeed_enabled:
+                            unwrapped_value_model_res = self.value_model_residual.module
+                        else:
+                            unwrapped_value_model_res = self.value_model_residual
                         full_value_res, _, _ = get_reward(
                             unwrapped_value_model_res, query_response, processing_class.pad_token_id, context_length
                         )
@@ -966,12 +1005,8 @@ class PPOTrainer(BaseTrainer):
                             # Backward + step for policy + base critic
                             loss_base = pg_loss + args.vf_coef * vf_loss_base
                             accelerator.backward(loss_base)
-                            if args.dart_enabled and hasattr(self, 'optimizer_base'):
-                                self.optimizer_base.step()
-                                self.optimizer_base.zero_grad()
-                            else:
-                                optimizer.step()
-                                optimizer.zero_grad()
+                            optimizer.step()
+                            optimizer.zero_grad()
 
                             # Free policy + base critic activations before residual forward
                             # fmt: off
@@ -993,10 +1028,15 @@ class PPOTrainer(BaseTrainer):
                                     self.value_model_residual, mb_query_responses,
                                     processing_class.pad_token_id,
                                 )
-                                unwrapped_res = accelerator.unwrap_model(self.value_model_residual)
-                                vpred_res = unwrapped_res.score(
-                                    res_output.hidden_states[-1]
-                                )[:, context_length - 1 : -1].squeeze(-1)
+                                if self.is_deepspeed_enabled:
+                                    # DeepSpeed engine: the model itself handles score
+                                    vpred_res = self.value_model_residual.module.score(
+                                        res_output.hidden_states[-1]
+                                    )[:, context_length - 1 : -1].squeeze(-1)
+                                else:
+                                    vpred_res = self.value_model_residual.score(
+                                        res_output.hidden_states[-1]
+                                    )[:, context_length - 1 : -1].squeeze(-1)
                                 vpred_res = torch.masked_fill(vpred_res, padding_mask_p1[micro_batch_inds], 0)
                                 # Residual target: high-lambda returns minus base value predictions
                                 residual_target = mb_return_res - mb_values_base.detach()
@@ -1004,9 +1044,13 @@ class PPOTrainer(BaseTrainer):
                                     (vpred_res - residual_target) ** 2,
                                     ~padding_mask_p1[micro_batch_inds],
                                 )
-                                accelerator.backward(vf_loss_res)
-                                self.optimizer_res.step()
-                                self.optimizer_res.zero_grad()
+                                if self.is_deepspeed_enabled:
+                                    self.value_model_residual.backward(vf_loss_res)
+                                    self.value_model_residual.step()
+                                else:
+                                    accelerator.backward(vf_loss_res)
+                                    self.optimizer_res.step()
+                                    self.optimizer_res.zero_grad()
                                 del res_output, vpred_res, residual_target, vf_loss_res, mb_return_res
                                 empty_cache()
 
@@ -1037,8 +1081,8 @@ class PPOTrainer(BaseTrainer):
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
-                if args.dart_enabled and hasattr(self, 'lr_scheduler_base'):
-                    metrics["lr_base"] = self.lr_scheduler_base.get_last_lr()[0]
+                if args.dart_enabled:
+                    metrics["lr_base"] = self.lr_scheduler.get_last_lr()[0]
                     metrics["lr_res"] = self.lr_scheduler_res.get_last_lr()[0]
                 else:
                     metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
@@ -1057,9 +1101,12 @@ class PPOTrainer(BaseTrainer):
                 self.log(metrics)
 
             # DART: Step both schedulers
-            if args.dart_enabled and hasattr(self, 'lr_scheduler_base'):
-                self.lr_scheduler_base.step()
-                self.lr_scheduler_res.step()
+            if args.dart_enabled and hasattr(self, "lr_scheduler_res"):
+                self.lr_scheduler.step()
+                # For non-DeepSpeed, step the residual scheduler manually.
+                # For DeepSpeed, the residual engine's .step() handles its scheduler.
+                if not self.is_deepspeed_enabled:
+                    self.lr_scheduler_res.step()
             else:
                 self.lr_scheduler.step()
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
