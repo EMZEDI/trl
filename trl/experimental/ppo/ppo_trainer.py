@@ -501,13 +501,14 @@ class PPOTrainer(BaseTrainer):
         # DART: Always use separate optimizers for base and residual, even with DeepSpeed.
         # The residual model will get its own DeepSpeed engine via deepspeed.initialize().
         if args.dart_enabled and optimizers == (None, None):
-            # Base optimizer: actor + base critic (will be wrapped by accelerator.prepare)
-            base_params = list(self.policy_model.parameters()) + list(self.value_model.parameters())
+            # Base optimizer: actor + base critic — only TRAINABLE params (critical for LoRA)
+            base_params = [p for p in self.policy_model.parameters() if p.requires_grad] + \
+                          [p for p in self.value_model.parameters() if p.requires_grad]
             self.optimizer = torch.optim.AdamW(base_params, lr=args.learning_rate, eps=1e-5)
 
             # Residual optimizer: residual critic only (will be prepared separately)
             self.optimizer_res = torch.optim.AdamW(
-                self.value_model_residual.parameters(),
+                [p for p in self.value_model_residual.parameters() if p.requires_grad],
                 lr=args.learning_rate * args.dart_lr_scale,
                 eps=1e-5,
             )
