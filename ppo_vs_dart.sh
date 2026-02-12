@@ -1,10 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=dart_vs_ppo_v2
-#SBATCH --partition=main
+#SBATCH --nodes=2                 # Request 2 distinct nodes
+#SBATCH --ntasks-per-node=1       # 1 main task per node
 #SBATCH --cpus-per-task=6
-#SBATCH --gres=gpu:a100l:2
-#SBATCH --mem=48G
-#SBATCH --time=12:00:00
+#SBATCH --gres=gpu:h100:4        # 4 GPUs per node
+#SBATCH --mem=0
+#SBATCH --account=aip-rrabba
+#SBATCH --time=3:00:00
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
@@ -17,13 +19,25 @@ export NCCL_TIMEOUT=3600
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_BLOCKING_WAIT=1
 
-# --- Run 1: DART enabled ---
-accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+# Get the list of nodes allocated to the job
+nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST)
+nodes_array=($nodes)
+
+node1=${nodes_array[0]}
+node2=${nodes_array[1]}
+
+echo "Node 1: $node1 (Running DART)"
+echo "Node 2: $node2 (Running PPO Baseline)"
+
+# --- Run 1: DART Version (Running on Node 1) ---
+srun --nodes=1 --nodelist=$node1 --exclusive --gres=gpu:4 bash -c "
+    source .env; 
+    accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
     --num_processes 2 \
     examples/scripts/ppo/dart.py \
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
-    --output_dir /network/scratch/s/shahrad.mohammadzadeh/pythia-1b-dart-v2 \
+    --output_dir /scratch/s/shahradm/pythia-1b-dart-v2 \
     --num_ppo_epochs 4 \
     --num_mini_batches 1 \
     --learning_rate 3e-5 \
@@ -48,14 +62,17 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --lora_r 16 \
     --lora_alpha 32 \
     --lora_task_type CAUSAL_LM
+" & 
 
-# --- Run 2: Standard PPO baseline (DART disabled) ---
-accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+# --- Run 2: Standard PPO baseline (Running on Node 2) ---
+srun --nodes=1 --nodelist=$node2 --exclusive --gres=gpu:4 bash -c "
+    source .env;
+    accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
     --num_processes 2 \
     examples/scripts/ppo/dart.py \
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
-    --output_dir /network/scratch/s/shahrad.mohammadzadeh/pythia-1b-ppo-v2 \
+    --output_dir /scratch/s/shahradm/pythia-1b-ppo-v2 \
     --num_ppo_epochs 4 \
     --num_mini_batches 1 \
     --learning_rate 3e-5 \
@@ -79,3 +96,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --lora_r 16 \
     --lora_alpha 32 \
     --lora_task_type CAUSAL_LM
+" & 
+
+# Wait for both background jobs to finish before exiting the SLURM job
+wait
