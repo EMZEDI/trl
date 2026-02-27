@@ -32,18 +32,16 @@ def format_reward(completions, **kwargs):
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-def prepare_gsm8k(example):
-    answer = example["answer"].split("####")[-1].strip()
+def prepare_math(example):
+    sol = example["solution"]
+    m = re.search(r"\\boxed\{(.*?)\}", sol)
+    ground_truth = m.group(1).strip() if m else sol.strip()
     return {
         "prompt": [
-            {"role": "system", "content": (
-                "Solve the problem step by step. "
-                "Wrap your reasoning in <reasoning>...</reasoning> "
-                "and your final numeric answer in <answer>...</answer> and \\boxed{}."
-            )},
-            {"role": "user", "content": example["question"]},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": example["problem"]},
         ],
-        "ground_truth": answer,
+        "ground_truth": ground_truth,
     }
 
 
@@ -52,14 +50,10 @@ if __name__ == "__main__":
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    raw = load_dataset("openai/gsm8k", "main")
-    train_dataset = raw["train"].map(
-        prepare_gsm8k, remove_columns=raw["train"].column_names
-    )
-    eval_dataset = raw["test"].map(
-        prepare_gsm8k, remove_columns=raw["test"].column_names
-    )
 
+    raw = load_dataset("lighteval/MATH", "all")
+    train_dataset = raw["train"].map(prepare_math, remove_columns=raw["train"].column_names)
+    eval_dataset  = raw["test"].map(prepare_math,  remove_columns=raw["test"].column_names)
     # ── LoRA config ───────────────────────────────────────────────────────────
     # DART trains: policy LoRA r=16  +  residual critic LoRA r=16
     # → GRPO uses r=32 on all-linear to match total trainable param count

@@ -146,19 +146,24 @@ SYSTEM_PROMPT = (
     "and your final numeric answer in <answer>...</answer> and \\boxed{}."
 )
 
-def prepare_gsm8k(example, tokenizer):
+def prepare_math(example, tokenizer):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": example["question"]},
+        {"role": "user",   "content": example["problem"]},   # MATH uses "problem" not "question"
     ]
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    ground_truth = example["answer"].split("####")[-1].strip()
+    # MATH answers are already in \boxed{} form in the "solution" field
+    # Extract just the final boxed answer for reward comparison
+    sol = example["solution"]
+    m = re.search(r"\\boxed\{(.*?)\}", sol)
+    ground_truth = m.group(1).strip() if m else sol.strip()
     return {"prompt": prompt, "ground_truth": ground_truth}
 
 
 def build_tokenized_dataset(raw_split, tokenizer, max_prompt_length, num_proc):
+    max_prompt_length=512   # MATH problems are longer than GSM8K
     def tokenize(ex):
         ids = tokenizer(ex["prompt"], padding=False)["input_ids"]
         return {"input_ids": ids, "lengths": len(ids), "ground_truth": ex["ground_truth"]}

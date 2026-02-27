@@ -45,8 +45,8 @@ echo "Allocated ${#nodes_array[@]} nodes: ${nodes_array[*]}"
 DART_COMMON="\
     --model_name_or_path ${MODEL} \
     --sft_model_path ${MODEL} \
-    --dataset_name openai/gsm8k \
-    --dataset_config main \
+    --dataset_name lighteval/MATH \
+    --dataset_config all \
     --dataset_test_split test \
     --num_ppo_epochs 4 \
     --num_mini_batches 1 \
