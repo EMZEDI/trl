@@ -1086,6 +1086,54 @@ class PPOTrainer(BaseTrainer):
                 metrics["val/ratio"] = self.accelerator.gather_for_metrics(ratio_stats).mean().item()
                 metrics["val/ratio_var"] = self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 metrics["val/num_eos_tokens"] = (responses == processing_class.eos_token_id).sum().item()
+
+                # ----------------- START OF NEW ANALYSIS BLOCK -----------------
+                # 1. Compute Monte Carlo Returns (G_t)
+                # Note: 'rewards' is already available and might be whitened.
+                # We compute G_t = r_t + gamma * r_{t+1} + ... masked by sequence length
+                returns_mc = torch.zeros_like(rewards)
+                ret = 0
+                for t in reversed(range(returns_mc.shape[1])):
+                    # Mask padding to ensure we don't carry over values across padding (though values should be 0)
+                    ret = rewards[:, t] + args.gamma * ret * (~padding_mask_p1[:, t]).float() 
+                    returns_mc[:, t] = ret
+                
+                # Mask out padding from returns
+                returns_mc = torch.masked_fill(returns_mc, padding_mask_p1, 0)
+                
+                # 2. MSE Analysis (Empirical Value Accuracy)
+                # Compare V_base vs G_t
+                validation_mask = ~padding_mask_p1
+                if validation_mask.sum() > 0:
+                    mse_base = ((values_base - returns_mc)**2 * validation_mask).sum() / validation_mask.sum()
+                    metrics["analysis/mse_v_base"] = self.accelerator.gather_for_metrics(mse_base).mean().item()
+                    
+                    if args.dart_enabled and is_residual_active:
+                        # Compare V_total vs G_t
+                        mse_total = ((values - returns_mc)**2 * validation_mask).sum() / validation_mask.sum()
+                        metrics["analysis/mse_v_total"] = self.accelerator.gather_for_metrics(mse_total).mean().item()
+                        # Positive value means DART reduced error
+                        metrics["analysis/mse_improvement"] = (metrics["analysis/mse_v_base"] - metrics["analysis/mse_v_total"])
+
+                # 3. Advantage Correlation Analysis
+                # We use the computed MC return as a proxy for "True Value" to get "True Advantage"
+                # A_true ~= G_t - V_t
+                # Compare against the GAE advantages used for training ('advantages' variable)
+                
+                # Calculate simple MC advantage
+                # Note: 'values' is V_total (base + res) if DART is active, else V_base
+                adv_mc = returns_mc - values
+                
+                # Flatten valid tokens only
+                flat_gae = advantages[~padding_mask]
+                flat_mc_adv = adv_mc[~padding_mask]
+                
+                if flat_gae.numel() > 1:
+                    # Calculate correlation
+                    correlation = torch.corrcoef(torch.stack([flat_gae, flat_mc_adv]))[0, 1]
+                    metrics["analysis/advantage_correlation"] = self.accelerator.gather_for_metrics(correlation).mean().item()
+                # ----------------- END OF NEW ANALYSIS BLOCK -----------------
+
                 if args.dart_enabled:
                     metrics["lr_base"] = self.lr_scheduler.get_last_lr()[0]
                     metrics["lr_res"] = self.lr_scheduler_res.get_last_lr()[0]
