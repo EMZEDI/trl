@@ -9,14 +9,16 @@
 DART (Dual Adaptive Residual Tracking) Training Script — GSM8K Edition
 =======================================================================
 
-Differences from the TL;DR version:
-  - NO pretrained reward model: rewards are rule-based (answer correctness + format)
-  - Value model and residual critic are initialized from the SFT/policy backbone
-    with a randomly initialized scalar score head (standard for math RL)
-  - Dataset: openai/gsm8k with chat-template formatted prompts
-  - Policy: Qwen2.5-Math-1.5B (math-pretrained base, no instruction tuning needed)
+Key differences from TL;DR dart.py:
+  - Rule-based rewards (correctness + format), NO pretrained reward model
+  - Value heads initialized from policy backbone with random score head
+  - RuleBasedRewardModel shim makes get_reward() work with decoded text
+  - ground_truth column preserved through collation via _PassthroughCollator
+    (single addition to PPOTrainer.__init__ — see ppo_trainer.py)
+  - Dataset: openai/gsm8k, chat-templated prompts
+  - Model: Qwen/Qwen2.5-Math-1.5B
 
-Single GPU — DART:
+Single GPU:
 python examples/scripts/ppo/dart.py \
     --dataset_name openai/gsm8k \
     --dataset_config main \
@@ -36,7 +38,7 @@ python examples/scripts/ppo/dart.py \
     --lora_alpha 32 \
     --report_to wandb
 
-Disable DART → standard PPO baseline:
+Standard PPO baseline (disable DART):
     --dart_enabled false
 """
 
@@ -44,6 +46,7 @@ import os
 import re
 
 import torch
+import torch.nn as nn
 from accelerate import PartialState
 from datasets import load_dataset
 from transformers import (
@@ -65,9 +68,6 @@ from trl.experimental.ppo import PPOConfig, PPOTrainer
 # ── DeepSpeed Zero3 helper ────────────────────────────────────────────────────
 
 def _no_zero3_init():
-    """Temporarily pause DeepSpeed Zero3 Init if active.
-    Models loaded inside will NOT be sharded during from_pretrained.
-    """
     from contextlib import nullcontext
     try:
         state = PartialState()
@@ -80,28 +80,20 @@ def _no_zero3_init():
 
 
 # ── Rule-based reward functions ───────────────────────────────────────────────
-# These replace the pretrained reward model used in the TL;DR version.
-# PPOTrainer calls reward_fn(queries, responses) → List[float]
 
 def extract_answer(text):
     m = re.search(r"\\boxed\{(.*?)\}", text)
     if m: return m.group(1).strip()
     m = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if m: return m.group(1).strip()
-    # fallback: GSM8K native #### pattern
     m = re.search(r"####\s*([\d,.\-]+)", text)
     if m: return m.group(1).replace(",", "").strip()
     return ""
 
-def compute_rewards(queries, responses, ground_truths):
-    """
-    Returns a list of scalar rewards for each (query, response) pair.
-    Correctness: +2.0 if extracted answer matches ground truth
-    Format:      +0.5 if response has <reasoning>...</reasoning><answer>...</answer>
-    """
-    rewards = []
+def compute_rewards(responses_text, ground_truths):
     fmt_pat = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    for response, gt in zip(responses, ground_truths):
+    rewards = []
+    for response, gt in zip(responses_text, ground_truths):
         r = 0.0
         if extract_answer(response) == gt.strip():
             r += 2.0
@@ -111,7 +103,42 @@ def compute_rewards(queries, responses, ground_truths):
     return rewards
 
 
-# ── Dataset preparation ───────────────────────────────────────────────────────
+# ── RuleBasedRewardModel ──────────────────────────────────────────────────────
+# Shim that makes get_reward() work without a neural reward model.
+# PPOTrainer calls: get_reward(reward_model, postprocessed_query_response,
+#                              pad_token_id, context_length)
+# get_reward internally calls reward_model(input_ids, attention_mask)
+# and reads .logits from the output.
+# We intercept by storing the tokenizer + current batch ground_truths,
+# decoding input_ids on the fly, and returning rule-based scores as .logits.
+
+class RuleBasedRewardModel(nn.Module):
+    def __init__(self, tokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self._current_ground_truths = None   # set before each get_reward call
+        # Dummy param so accelerator.prepare() / deepspeed.initialize() don't crash
+        self._dummy = nn.Linear(1, 1, bias=False)
+
+    def set_ground_truths(self, ground_truths):
+        """Call this before each rollout batch with the current ground truths."""
+        self._current_ground_truths = ground_truths
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        decoded = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        if self._current_ground_truths is None:
+            scores = torch.zeros(len(decoded), device=input_ids.device)
+        else:
+            raw = compute_rewards(decoded, self._current_ground_truths)
+            scores = torch.tensor(raw, dtype=torch.float32, device=input_ids.device)
+
+        # get_reward expects output.logits of shape (B, seq_len, 1) or (B, 1)
+        # It reads the score at the last non-pad position — return (B, 1) scalar logits
+        from transformers.utils import ModelOutput
+        return ModelOutput(logits=scores.unsqueeze(-1))
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = (
     "Solve the problem step by step. "
@@ -128,25 +155,27 @@ def prepare_gsm8k(example, tokenizer):
         messages, tokenize=False, add_generation_prompt=True
     )
     ground_truth = example["answer"].split("####")[-1].strip()
-    return {
-        "prompt": prompt,
-        "ground_truth": ground_truth,
-    }
+    return {"prompt": prompt, "ground_truth": ground_truth}
 
-def tokenize_dataset(dataset, tokenizer, max_prompt_length, num_proc):
-    def tokenize(element):
-        input_ids = tokenizer(element["prompt"], padding=False)["input_ids"]
-        return {"input_ids": input_ids, "lengths": len(input_ids)}
 
-    dataset = dataset.map(tokenize, remove_columns=["prompt"], num_proc=num_proc)
-    dataset = dataset.filter(lambda x: x["lengths"] <= max_prompt_length, num_proc=num_proc)
-    return dataset
+def build_tokenized_dataset(raw_split, tokenizer, max_prompt_length, num_proc):
+    def tokenize(ex):
+        ids = tokenizer(ex["prompt"], padding=False)["input_ids"]
+        return {"input_ids": ids, "lengths": len(ids), "ground_truth": ex["ground_truth"]}
+
+    ds = raw_split.map(
+        tokenize,
+        remove_columns=[c for c in raw_split.column_names if c not in ("ground_truth",)],
+        num_proc=num_proc,
+    )
+    # Remove "prompt" explicitly if it survived (tokenize keeps ground_truth)
+    if "prompt" in ds.column_names:
+        ds = ds.remove_columns(["prompt"])
+    ds = ds.filter(lambda x: x["lengths"] <= max_prompt_length, num_proc=num_proc)
+    return ds
 
 
 # ── Value model builder ───────────────────────────────────────────────────────
-# For GSM8K there is no pretrained RM checkpoint.
-# We initialize both value heads from the policy backbone with a random score head.
-# This is standard practice for math RL (same as DeepSeekMath, RLVR papers).
 
 def build_value_model(backbone_path, tokenizer, model_kwargs, trust_remote_code, no_zero3=False):
     ctx = _no_zero3_init() if no_zero3 else __import__("contextlib").nullcontext()
@@ -155,7 +184,7 @@ def build_value_model(backbone_path, tokenizer, model_kwargs, trust_remote_code,
             backbone_path,
             trust_remote_code=trust_remote_code,
             num_labels=1,
-            ignore_mismatched_sizes=True,   # score head is new/random — expected
+            ignore_mismatched_sizes=True,  # score head is randomly initialized — expected
             **model_kwargs,
         )
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -168,7 +197,6 @@ if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
 
-    # DART default on
     if not hasattr(training_args, "dart_enabled") or training_args.dart_enabled is None:
         training_args.dart_enabled = True
 
@@ -197,15 +225,16 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
+    # ── Reward model (rule-based shim) ────────────────────────────────────────
+    # No pretrained checkpoint needed. Scores come from extract_answer() correctness.
+    reward_model = RuleBasedRewardModel(tokenizer)
+    print("[dart.py] Using rule-based reward model (no neural RM checkpoint needed)")
+
     # ── Value model (base critic) ─────────────────────────────────────────────
-    # Initialized from the policy backbone; score head is random (no pretrained RM).
     print(f"Building base value model from {training_args.sft_model_path}")
     value_model = build_value_model(
-        training_args.sft_model_path,
-        tokenizer,
-        model_kwargs,
-        model_args.trust_remote_code,
-        no_zero3=False,   # primary model, let ZeRO shard it normally
+        training_args.sft_model_path, tokenizer, model_kwargs,
+        model_args.trust_remote_code, no_zero3=False,
     )
     v_params = sum(p.numel() for p in value_model.parameters() if p.requires_grad)
     print(f"  Base value model trainable params: {v_params:,}")
@@ -213,32 +242,16 @@ if __name__ == "__main__":
     # ── DART: residual critic ─────────────────────────────────────────────────
     if training_args.dart_enabled:
         print("DART enabled — building residual critic")
-        print(f"  dart_lambda_res:  {training_args.dart_lambda_res}")
-        print(f"  dart_lr_scale:    {training_args.dart_lr_scale}")
-        print(f"  dart_warmup_frac: {training_args.dart_warmup_frac}")
-        # Load with _no_zero3_init so residual is not sharded during init;
-        # PPOTrainer prepares it separately via accelerator.prepare()
         value_model_residual = build_value_model(
-            training_args.sft_model_path,
-            tokenizer,
-            model_kwargs,
-            model_args.trust_remote_code,
-            no_zero3=True,
+            training_args.sft_model_path, tokenizer, model_kwargs,
+            model_args.trust_remote_code, no_zero3=True,
         )
         r_params = sum(p.numel() for p in value_model_residual.parameters() if p.requires_grad)
         print(f"  Residual critic trainable params: {r_params:,}")
-        print(f"  DART total critic params: {v_params + r_params:,}")
+        print(f"  DART total critic params:         {v_params + r_params:,}")
     else:
         print("DART disabled — running standard PPO baseline")
         value_model_residual = None
-
-    # ── Reward model ──────────────────────────────────────────────────────────
-    # For GSM8K: rule-based rewards, no neural reward model.
-    # We pass reward_model=None and override the reward computation via
-    # a reward_fn hook in PPOTrainer (see training_args.reward_fn below).
-    # If your PPOTrainer version requires a reward_model object, pass a dummy
-    # wrapper — see RuleBasedRewardModel below.
-    reward_model = None   # <-- set to RuleBasedRewardModel() if trainer requires it
 
     # ── Policy ────────────────────────────────────────────────────────────────
     print(f"Loading policy from {training_args.sft_model_path}")
@@ -247,11 +260,14 @@ if __name__ == "__main__":
         trust_remote_code=model_args.trust_remote_code,
         **model_kwargs,
     )
-    # Resize embeddings if pad token was freshly added
-    policy.resize_token_embeddings(len(tokenizer))
-    value_model.resize_token_embeddings(len(tokenizer))
-    if value_model_residual is not None:
-        value_model_residual.resize_token_embeddings(len(tokenizer))
+    # Resize all models if pad token was freshly added
+    new_vocab = len(tokenizer)
+    for m in [policy, value_model, value_model_residual]:
+        if m is not None:
+            m.resize_token_embeddings(new_vocab)
+
+    p_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    print(f"Policy trainable params: {p_params:,}")
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
@@ -261,12 +277,9 @@ if __name__ == "__main__":
                 trust_remote_code=model_args.trust_remote_code,
                 **model_kwargs,
             )
-        ref_policy.resize_token_embeddings(len(tokenizer))
+        ref_policy.resize_token_embeddings(new_vocab)
     else:
-        ref_policy = None   # PEFT: ref policy is implicit (merged adapter off)
-
-    total_policy_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"Policy trainable params: {total_policy_params:,}")
+        ref_policy = None  # PEFT: ref is implicit via disabled adapter
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     raw = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
@@ -277,73 +290,86 @@ if __name__ == "__main__":
             remove_columns=raw[script_args.dataset_train_split].column_names,
             num_proc=training_args.dataset_num_proc,
         )
-        eval_dataset = raw[training_args.dataset_test_split if hasattr(training_args, "dataset_test_split")
-                           else script_args.dataset_test_split].map(
+        eval_split = getattr(script_args, "dataset_test_split", "test")
+        eval_dataset = raw[eval_split].map(
             lambda ex: prepare_gsm8k(ex, tokenizer),
-            remove_columns=raw["test"].column_names,
+            remove_columns=raw[eval_split].column_names,
             num_proc=training_args.dataset_num_proc,
         )
-        # Tokenize and filter prompts that are too long
-        train_dataset = tokenize_dataset(
+        train_dataset = build_tokenized_dataset(
             train_dataset, tokenizer,
-            max_prompt_length=256,   # GSM8K questions are short
+            max_prompt_length=256,
             num_proc=training_args.dataset_num_proc,
         )
-        eval_dataset = tokenize_dataset(
+        eval_dataset = build_tokenized_dataset(
             eval_dataset, tokenizer,
             max_prompt_length=256,
             num_proc=training_args.dataset_num_proc,
         )
 
-    # ── Reward fn wrapper ─────────────────────────────────────────────────────
-    # Store ground truths alongside dataset so PPOTrainer can pass them to
-    # compute_rewards. The exact hook depends on your PPOTrainer implementation.
-    # If your trainer exposes a reward_fn argument, pass this lambda:
-    #
-    #   reward_fn = lambda queries, responses, batch: compute_rewards(
-    #       queries, responses, batch["ground_truth"]
-    #   )
-    #
-    # If it requires a reward_model with a .forward(), use this shim:
+    # ── Ground truth hook ─────────────────────────────────────────────────────
+    # PPOTrainer will now have ground_truth in each batch dict (via
+    # _PassthroughCollator added to ppo_trainer.py). We subclass PPOTrainer
+    # to inject ground_truths into the reward model before each get_reward call.
 
-    class RuleBasedRewardModel(torch.nn.Module):
-        """Shim so PPOTrainer can call reward_model(input_ids, attention_mask).
-        Returns scalar rewards computed by rule-based functions, not a neural net.
-        Requires ground_truth to be stored on the batch — set via trainer hook.
-        """
-        def __init__(self):
-            super().__init__()
-            # Dummy parameter so accelerator.prepare() doesn't complain
-            self._dummy = torch.nn.Linear(1, 1, bias=False)
+    class GSM8KPPOTrainer(PPOTrainer):
+        """Thin subclass that feeds ground_truth from the batch into the
+        RuleBasedRewardModel before the scorer is called during rollout."""
 
-        def forward(self, input_ids, attention_mask, ground_truth=None, **kwargs):
-            # Decode responses
-            decoded = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-            if ground_truth is None:
-                # Fallback: return zeros (should not happen in practice)
-                return torch.zeros(len(decoded))
-            rewards = compute_rewards([""] * len(decoded), decoded, ground_truth)
-            return torch.tensor(rewards, dtype=torch.float32)
+        def train(self):
+            # Monkey-patch the inner train loop's data loading to set ground truths.
+            # We override the repeat_generator to inject ground_truth on each batch.
+            # Since train() uses iter_dataloader internally, we hook it via
+            # a wrapper on the dataloader.
+            _original_train = super().train
 
-    reward_model = RuleBasedRewardModel()
+            # Wrap the dataloader so every __next__ call registers ground_truth
+            original_dataloader = self.dataloader
+
+            class _GTInjectingDataLoader:
+                def __init__(self, dl, reward_model):
+                    self._dl = dl
+                    self._rm = reward_model
+                    self.__iter__ = dl.__iter__
+
+                def __iter__(self):
+                    for batch in self._dl:
+                        if "ground_truth" in batch:
+                            self._rm.set_ground_truths(batch["ground_truth"])
+                        yield batch
+
+                def __len__(self):
+                    return len(self._dl)
+
+            self.dataloader = _GTInjectingDataLoader(original_dataloader, self.reward_model)
+            _original_train()
+            self.dataloader = original_dataloader  # restore
+
+        def generate_completions(self, sampling=False):
+            # Also inject ground_truth during eval completions
+            for batch in self.eval_dataloader:
+                if "ground_truth" in batch:
+                    self.reward_model.set_ground_truths(batch["ground_truth"])
+                break  # only need first batch for sampling=True; full loop handles rest
+            super().generate_completions(sampling=sampling)
 
     # ── Trainer ───────────────────────────────────────────────────────────────
-    trainer = PPOTrainer(
+    trainer = GSM8KPPOTrainer(
         args=training_args,
         processing_class=tokenizer,
         model=policy,
         ref_model=ref_policy,
         reward_model=reward_model,
         value_model=value_model,
-        value_model_residual=value_model_residual,  # DART extension
+        value_model_residual=value_model_residual,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
     )
 
     trainer.train()
-
     trainer.save_model(training_args.output_dir)
+
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
 

@@ -375,8 +375,29 @@ class PPOTrainer(BaseTrainer):
         self.policy_model = model
 
         # Define the collator if not provided
+        # ── GSM8K / rule-based reward: preserve ground_truth through collation ────
+        # DataCollatorWithPadding silently drops non-tensor string columns.
+        # Wrap it so that string fields (e.g. ground_truth) are passed through as lists.
+        class _PassthroughCollator:
+            """Wraps a base collator and passes string columns through as lists."""
+            def __init__(self, base_collator, passthrough_keys=("ground_truth",)):
+                self.base = base_collator
+                self.passthrough_keys = passthrough_keys
+
+            def __call__(self, features):
+                # Separate passthrough fields from tensor fields
+                passthrough = {k: [f[k] for f in features]
+                            for k in self.passthrough_keys if k in features[0]}
+                tensor_features = [{k: v for k, v in f.items()
+                                    if k not in self.passthrough_keys} for f in features]
+                batch = self.base(tensor_features)
+                batch.update(passthrough)
+                return batch
+
         if data_collator is None:
-            data_collator = DataCollatorWithPadding(self.processing_class)
+            base_collator = DataCollatorWithPadding(self.processing_class)
+            data_collator = _PassthroughCollator(base_collator)
+
 
         # Handle stop token settings: update policy model's generation_config to use provided stop token
         if args.stop_token and args.stop_token_id:
