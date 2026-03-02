@@ -287,7 +287,10 @@ if __name__ == "__main__":
         ref_policy = None  # PEFT: ref is implicit via disabled adapter
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    raw = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    if script_args.dataset_config:
+        raw = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    else:
+        raw = load_dataset(script_args.dataset_name)
 
     with PartialState().local_main_process_first():
         train_dataset = raw[script_args.dataset_train_split].map(
