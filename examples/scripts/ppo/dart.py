@@ -48,7 +48,7 @@ import re
 import torch
 import torch.nn as nn
 from accelerate import PartialState
-from datasets import load_dataset
+from datasets import DatasetDict, concatenate_datasets, load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -101,6 +101,29 @@ def compute_rewards(responses_text, ground_truths):
             r += 0.5
         rewards.append(r)
     return rewards
+
+
+# ── Multi-config dataset loader ───────────────────────────────────────────────
+
+MATH_CONFIGS = [
+    "algebra", "counting_and_probability", "geometry",
+    "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
+]
+
+def load_math_dataset(name, config=None):
+    """Load dataset, handling multi-config datasets like EleutherAI/hendrycks_math."""
+    if config:
+        return load_dataset(name, config)
+    try:
+        return load_dataset(name)
+    except ValueError:
+        # Multi-config dataset: concatenate all MATH subsets
+        splits = {}
+        for cfg in MATH_CONFIGS:
+            ds = load_dataset(name, cfg)
+            for split in ds:
+                splits.setdefault(split, []).append(ds[split])
+        return DatasetDict({k: concatenate_datasets(v) for k, v in splits.items()})
 
 
 # ── RuleBasedRewardModel ──────────────────────────────────────────────────────
@@ -163,7 +186,6 @@ def prepare_math(example, tokenizer):
 
 
 def build_tokenized_dataset(raw_split, tokenizer, max_prompt_length, num_proc):
-    max_prompt_length=512   # MATH problems are longer than GSM8K
     def tokenize(ex):
         ids = tokenizer(ex["prompt"], padding=False)["input_ids"]
         return {"input_ids": ids, "lengths": len(ids), "ground_truth": ex["ground_truth"]}
@@ -287,31 +309,31 @@ if __name__ == "__main__":
         ref_policy = None  # PEFT: ref is implicit via disabled adapter
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    if script_args.dataset_config:
-        raw = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    else:
-        raw = load_dataset(script_args.dataset_name)
+    raw = load_math_dataset(
+        script_args.dataset_name,
+        config=getattr(script_args, "dataset_config", None),
+    )
 
     with PartialState().local_main_process_first():
         train_dataset = raw[script_args.dataset_train_split].map(
-            lambda ex: prepare_gsm8k(ex, tokenizer),
+            lambda ex: prepare_math(ex, tokenizer),
             remove_columns=raw[script_args.dataset_train_split].column_names,
             num_proc=training_args.dataset_num_proc,
         )
         eval_split = getattr(script_args, "dataset_test_split", "test")
         eval_dataset = raw[eval_split].map(
-            lambda ex: prepare_gsm8k(ex, tokenizer),
+            lambda ex: prepare_math(ex, tokenizer),
             remove_columns=raw[eval_split].column_names,
             num_proc=training_args.dataset_num_proc,
         )
         train_dataset = build_tokenized_dataset(
             train_dataset, tokenizer,
-            max_prompt_length=256,
+            max_prompt_length=512,
             num_proc=training_args.dataset_num_proc,
         )
         eval_dataset = build_tokenized_dataset(
             eval_dataset, tokenizer,
-            max_prompt_length=256,
+            max_prompt_length=512,
             num_proc=training_args.dataset_num_proc,
         )
 

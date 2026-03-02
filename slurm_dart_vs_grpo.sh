@@ -35,7 +35,7 @@ echo "Seeds: $S0 $S1 $S2 $S3"
 DART_COMMON="\
     --model_name_or_path ${MODEL} \
     --sft_model_path ${MODEL} \
-    --dataset_name hendrycks/math \
+    --dataset_name EleutherAI/hendrycks_math \
     --dataset_train_split train \
     --dataset_test_split test \
     --num_ppo_epochs 4 \
@@ -60,7 +60,7 @@ DART_COMMON="\
 
 GRPO_COMMON="\
     --model_name_or_path ${MODEL} \
-    --dataset_name hendrycks/math \
+    --dataset_name EleutherAI/hendrycks_math \
     --dataset_train_split train \
     --dataset_test_split test \
     --learning_rate 3e-6 \
