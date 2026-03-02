@@ -1,5 +1,6 @@
 # Copyright 2020-2026 The HuggingFace Team. Apache License 2.0
 
+import os
 import re
 
 from datasets import DatasetDict, concatenate_datasets, load_dataset
@@ -94,15 +95,16 @@ if __name__ == "__main__":
     train_split = getattr(script_args, "dataset_train_split", "train")
     test_split = getattr(script_args, "dataset_test_split", "test")
 
+    num_proc = os.cpu_count()
     train_dataset = raw[train_split].map(
         lambda ex: prepare_math(ex, tokenizer),
         remove_columns=raw[train_split].column_names,
-        num_proc=training_args.dataset_num_proc,
+        num_proc=num_proc,
     )
     eval_dataset = raw[test_split].map(
         lambda ex: prepare_math(ex, tokenizer),
         remove_columns=raw[test_split].column_names,
-        num_proc=training_args.dataset_num_proc,
+        num_proc=num_proc,
     )
 
     # ── LoRA config ───────────────────────────────────────────────────────────

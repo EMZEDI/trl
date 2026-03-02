@@ -617,9 +617,14 @@ class PPOTrainer(BaseTrainer):
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            self.reward_model = prepare_deepspeed(
-                self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
-            )
+            # Rule-based reward models (e.g. RuleBasedRewardModel) have no transformer
+            # backbone, so they cannot be wrapped by DeepSpeed or decomposed by get_reward().
+            if getattr(self.reward_model, '_is_rule_based', False):
+                self.reward_model = self.reward_model.to(self.accelerator.device)
+            else:
+                self.reward_model = prepare_deepspeed(
+                    self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
+                )
 
             if self.ref_model is None:
                 if not self.is_peft_model:
@@ -863,9 +868,23 @@ class PPOTrainer(BaseTrainer):
                         value_res = torch.zeros_like(value_base)
                         value = value_base
                     
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
+                    # Rule-based reward models compute scores from decoded text,
+                    # bypassing the backbone decomposition in get_reward().
+                    if getattr(reward_model, '_is_rule_based', False):
+                        # Slice ground truths for the current sub-batch
+                        if hasattr(reward_model, 'set_ground_truths') and "ground_truth" in data:
+                            reward_model.set_ground_truths(
+                                data["ground_truth"][i : i + args.local_rollout_forward_batch_size]
+                            )
+                        output = reward_model(
+                            input_ids=postprocessed_query_response,
+                            attention_mask=(postprocessed_query_response != processing_class.pad_token_id),
+                        )
+                        score = output.logits.squeeze(-1)
+                    else:
+                        _, score, _ = get_reward(
+                            reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        )
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -1270,9 +1289,19 @@ class PPOTrainer(BaseTrainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
+                    if getattr(self.reward_model, '_is_rule_based', False):
+                        # Set ground truths for this eval batch
+                        if hasattr(self.reward_model, 'set_ground_truths') and "ground_truth" in batch:
+                            self.reward_model.set_ground_truths(batch["ground_truth"])
+                        output = self.reward_model(
+                            input_ids=postprocessed_query_response,
+                            attention_mask=(postprocessed_query_response != processing_class.pad_token_id),
+                        )
+                        score = output.logits.squeeze(-1)
+                    else:
+                        _, score, _ = get_reward(
+                            self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        )
                     table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
                 if sampling:

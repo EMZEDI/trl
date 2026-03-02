@@ -136,6 +136,8 @@ def load_math_dataset(name, config=None):
 # decoding input_ids on the fly, and returning rule-based scores as .logits.
 
 class RuleBasedRewardModel(nn.Module):
+    _is_rule_based = True  # flag so PPOTrainer skips get_reward() decomposition
+
     def __init__(self, tokenizer):
         super().__init__()
         self.tokenizer = tokenizer
@@ -343,45 +345,10 @@ if __name__ == "__main__":
     # to inject ground_truths into the reward model before each get_reward call.
 
     class GSM8KPPOTrainer(PPOTrainer):
-        """Thin subclass that feeds ground_truth from the batch into the
-        RuleBasedRewardModel before the scorer is called during rollout."""
-
-        def train(self):
-            # Monkey-patch the inner train loop's data loading to set ground truths.
-            # We override the repeat_generator to inject ground_truth on each batch.
-            # Since train() uses iter_dataloader internally, we hook it via
-            # a wrapper on the dataloader.
-            _original_train = super().train
-
-            # Wrap the dataloader so every __next__ call registers ground_truth
-            original_dataloader = self.dataloader
-
-            class _GTInjectingDataLoader:
-                def __init__(self, dl, reward_model):
-                    self._dl = dl
-                    self._rm = reward_model
-                    self.__iter__ = dl.__iter__
-
-                def __iter__(self):
-                    for batch in self._dl:
-                        if "ground_truth" in batch:
-                            self._rm.set_ground_truths(batch["ground_truth"])
-                        yield batch
-
-                def __len__(self):
-                    return len(self._dl)
-
-            self.dataloader = _GTInjectingDataLoader(original_dataloader, self.reward_model)
-            _original_train()
-            self.dataloader = original_dataloader  # restore
-
-        def generate_completions(self, sampling=False):
-            # Also inject ground_truth during eval completions
-            for batch in self.eval_dataloader:
-                if "ground_truth" in batch:
-                    self.reward_model.set_ground_truths(batch["ground_truth"])
-                break  # only need first batch for sampling=True; full loop handles rest
-            super().generate_completions(sampling=sampling)
+        \"\"\"Thin subclass — ground_truth injection into the RuleBasedRewardModel
+        is now handled directly in ppo_trainer.py's rule-based scoring path.
+        This subclass is kept for any future MATH/GSM8K-specific overrides.\"\"\"
+        pass
 
     # ── Trainer ───────────────────────────────────────────────────────────────
     trainer = GSM8KPPOTrainer(

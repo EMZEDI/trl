@@ -70,7 +70,7 @@ GRPO_COMMON="\
     --max_completion_length ${RESPONSE_LENGTH} \
     --beta 0.05 \
     --loss_type bnpo \
-    --scale_rewards true \
+    --scale_rewards group \
     --eval_strategy steps \
     --eval_steps 200 \
     --report_to wandb"
