@@ -21,7 +21,8 @@ RESPONSE_LENGTH=512
 OUTPUT_BASE="$SCRATCH/math"
 BASE_PORT=29500
 MODEL="Qwen/Qwen2.5-Math-1.5B"
-ACCEL_CFG="examples/accelerate_configs/deepspeed_zero2.yaml"
+ACCEL_CFG_DART="examples/accelerate_configs/deepspeed_zero2.yaml"
+ACCEL_CFG_GRPO="examples/accelerate_configs/single_gpu.yaml"
 
 S0=${SEEDS[0]}
 S1=${SEEDS[1]}
@@ -80,7 +81,7 @@ srun --nodes=1 --nodelist="${nodes_array[0]}" bash -c "
     export NCCL_TIMEOUT=3600 TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
     CUDA_VISIBLE_DEVICES=0 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_DART} --num_processes 1 \
         --main_process_port $((BASE_PORT + 0)) \
         examples/scripts/ppo/dart.py ${DART_COMMON} \
         --seed ${S0} \
@@ -88,7 +89,7 @@ srun --nodes=1 --nodelist="${nodes_array[0]}" bash -c "
         --run_name dart-math-seed-${S0} &
 
     CUDA_VISIBLE_DEVICES=1 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_DART} --num_processes 1 \
         --main_process_port $((BASE_PORT + 1)) \
         examples/scripts/ppo/dart.py ${DART_COMMON} \
         --seed ${S1} \
@@ -96,7 +97,7 @@ srun --nodes=1 --nodelist="${nodes_array[0]}" bash -c "
         --run_name dart-math-seed-${S1} &
 
     CUDA_VISIBLE_DEVICES=2 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_DART} --num_processes 1 \
         --main_process_port $((BASE_PORT + 2)) \
         examples/scripts/ppo/dart.py ${DART_COMMON} \
         --seed ${S2} \
@@ -104,7 +105,7 @@ srun --nodes=1 --nodelist="${nodes_array[0]}" bash -c "
         --run_name dart-math-seed-${S2} &
 
     CUDA_VISIBLE_DEVICES=3 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_DART} --num_processes 1 \
         --main_process_port $((BASE_PORT + 3)) \
         examples/scripts/ppo/dart.py ${DART_COMMON} \
         --seed ${S3} \
@@ -120,7 +121,7 @@ srun --nodes=1 --nodelist="${nodes_array[1]}" bash -c "
     export NCCL_TIMEOUT=3600 TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
     CUDA_VISIBLE_DEVICES=0 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_GRPO} --num_processes 1 \
         --main_process_port $((BASE_PORT + 0)) \
         examples/scripts/grpo/gsm8k_grpo.py ${GRPO_COMMON} \
         --seed ${S0} \
@@ -128,7 +129,7 @@ srun --nodes=1 --nodelist="${nodes_array[1]}" bash -c "
         --run_name grpo-math-seed-${S0} &
 
     CUDA_VISIBLE_DEVICES=1 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_GRPO} --num_processes 1 \
         --main_process_port $((BASE_PORT + 1)) \
         examples/scripts/grpo/gsm8k_grpo.py ${GRPO_COMMON} \
         --seed ${S1} \
@@ -136,7 +137,7 @@ srun --nodes=1 --nodelist="${nodes_array[1]}" bash -c "
         --run_name grpo-math-seed-${S1} &
 
     CUDA_VISIBLE_DEVICES=2 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_GRPO} --num_processes 1 \
         --main_process_port $((BASE_PORT + 2)) \
         examples/scripts/grpo/gsm8k_grpo.py ${GRPO_COMMON} \
         --seed ${S2} \
@@ -144,7 +145,7 @@ srun --nodes=1 --nodelist="${nodes_array[1]}" bash -c "
         --run_name grpo-math-seed-${S2} &
 
     CUDA_VISIBLE_DEVICES=3 accelerate launch \
-        --config_file ${ACCEL_CFG} --num_processes 1 \
+        --config_file ${ACCEL_CFG_GRPO} --num_processes 1 \
         --main_process_port $((BASE_PORT + 3)) \
         examples/scripts/grpo/gsm8k_grpo.py ${GRPO_COMMON} \
         --seed ${S3} \

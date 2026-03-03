@@ -345,9 +345,9 @@ if __name__ == "__main__":
     # to inject ground_truths into the reward model before each get_reward call.
 
     class GSM8KPPOTrainer(PPOTrainer):
-        \"\"\"Thin subclass — ground_truth injection into the RuleBasedRewardModel
+        """Thin subclass — ground_truth injection into the RuleBasedRewardModel
         is now handled directly in ppo_trainer.py's rule-based scoring path.
-        This subclass is kept for any future MATH/GSM8K-specific overrides.\"\"\"
+        This subclass is kept for any future MATH/GSM8K-specific overrides."""
         pass
 
     # ── Trainer ───────────────────────────────────────────────────────────────
