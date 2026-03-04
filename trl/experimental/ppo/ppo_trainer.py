@@ -122,8 +122,9 @@ def batch_generation(
     generation_config: GenerationConfig,
 ):
     query_responses = []
-    logitss = []
+    logprobss = []
     batch_size = queries.shape[0]
+    context_length = queries.shape[1]
     for i in range(0, batch_size, local_rollout_forward_batch_size):
         query = queries[i : i + local_rollout_forward_batch_size]
         query_response, logits = generate(
@@ -132,18 +133,23 @@ def batch_generation(
             pad_token_id,
             generation_config,
         )
+        # Compute log-probs immediately and discard the huge vocab-dim logits.
+        # This avoids storing (batch, response_len, vocab_size) across all sub-batches.
+        response = query_response[:, context_length:]
+        logprob = selective_log_softmax(logits, response)
+        del logits
         query_responses.append(query_response)
-        logitss.append(logits)
+        logprobss.append(logprob)
 
     # padding tensors
     padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right")
-    padded_logitss = pad(logitss, padding_value=0, padding_side="right")
+    padded_logprobss = pad(logprobss, padding_value=0, padding_side="right")
 
     # reshaping
     padded_query_responses = padded_query_responses.view(-1, padded_query_responses.shape[-1])[:batch_size]
-    padded_logitss = padded_logitss.view(-1, *padded_logitss.shape[2:])[:batch_size]
+    padded_logprobss = padded_logprobss.view(-1, padded_logprobss.shape[-1])[:batch_size]
 
-    return padded_query_responses, padded_logitss
+    return padded_query_responses, padded_logprobss
 
 
 def exact_div(a, b, custom_error_message=""):
@@ -807,7 +813,7 @@ class PPOTrainer(BaseTrainer):
                         generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
                     ) as unwrapped_model
                 ):
-                    query_responses, logitss = batch_generation(
+                    query_responses, logprobss = batch_generation(
                         unwrapped_model.policy,
                         queries,
                         args.local_rollout_forward_batch_size,
@@ -819,10 +825,9 @@ class PPOTrainer(BaseTrainer):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                     response = query_response[:, context_length:]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                    logprob = selective_log_softmax(logits, response)
-                    del logits
-                    empty_cache()
+                    # Log-probs were already computed inside batch_generation to
+                    # avoid storing the massive (batch, seq, vocab) logits tensor.
+                    logprob = logprobss[i : i + args.local_rollout_forward_batch_size]
 
                     if ref_policy is None:
                         with self.null_ref_context():
