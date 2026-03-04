@@ -14,6 +14,7 @@ source .env
 
 export NCCL_TIMEOUT=3600
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SEEDS=(42 123 256 512)
 TOTAL_EPISODES=50000
@@ -21,7 +22,7 @@ RESPONSE_LENGTH=512
 OUTPUT_BASE="$SCRATCH/math"
 BASE_PORT=29500
 MODEL="Qwen/Qwen2.5-Math-1.5B"
-ACCEL_CFG_DART="examples/accelerate_configs/deepspeed_zero2.yaml"
+ACCEL_CFG_DART="examples/accelerate_configs/deepspeed_zero2_offload.yaml"
 ACCEL_CFG_GRPO="examples/accelerate_configs/single_gpu.yaml"
 
 S0=${SEEDS[0]}
@@ -46,7 +47,7 @@ DART_COMMON="\
     --gradient_accumulation_steps 32 \
     --total_episodes ${TOTAL_EPISODES} \
     --response_length ${RESPONSE_LENGTH} \
-    --local_rollout_forward_batch_size 2 \
+    --local_rollout_forward_batch_size 1 \
     --kl_coef 0.05 \
     --gradient_checkpointing \
     --dart_enabled true \
