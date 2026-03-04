@@ -537,12 +537,34 @@ class PPOTrainer(BaseTrainer):
             )
 
             # Residual optimizer: residual critic only (will be prepared separately)
-            self.optimizer_res = torch.optim.AdamW(
-                [p for p in self.value_model_residual.parameters() if p.requires_grad],
-                lr=args.learning_rate * args.dart_lr_scale,
-                eps=args.adam_epsilon,
-                weight_decay=args.weight_decay,
-            )
+            # When DeepSpeed CPU offload is enabled, we must use DeepSpeedCPUAdam.
+            _res_params = [p for p in self.value_model_residual.parameters() if p.requires_grad]
+            _use_cpu_offload = False
+            try:
+                _ds_plug = getattr(PartialState(), "deepspeed_plugin", None)
+                if _ds_plug is not None:
+                    _ds_cfg = _ds_plug.deepspeed_config
+                    _offload = _ds_cfg.get("zero_optimization", {}).get("offload_optimizer", {})
+                    if _offload.get("device", "none") != "none":
+                        _use_cpu_offload = True
+            except Exception:
+                pass
+
+            if _use_cpu_offload:
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                self.optimizer_res = DeepSpeedCPUAdam(
+                    _res_params,
+                    lr=args.learning_rate * args.dart_lr_scale,
+                    eps=args.adam_epsilon,
+                    weight_decay=args.weight_decay,
+                )
+            else:
+                self.optimizer_res = torch.optim.AdamW(
+                    _res_params,
+                    lr=args.learning_rate * args.dart_lr_scale,
+                    eps=args.adam_epsilon,
+                    weight_decay=args.weight_decay,
+                )
 
             from transformers.optimization import get_scheduler
 
@@ -648,9 +670,12 @@ class PPOTrainer(BaseTrainer):
 
                 ds_plugin = self.accelerator.state.deepspeed_plugin
                 ds_config = deepcopy(ds_plugin.deepspeed_config)
-                # Use the residual-specific learning rate
+                # Use the residual-specific learning rate.
+                # When CPU offload is active, use DeepSpeedCPUAdam; else AdamW.
+                _offload_cfg = ds_config.get("zero_optimization", {}).get("offload_optimizer", {})
+                _opt_type = "DeepSpeedCPUAdam" if _offload_cfg.get("device", "none") != "none" else "AdamW"
                 ds_config["optimizer"] = {
-                    "type": "AdamW",
+                    "type": _opt_type,
                     "params": {
                         "lr": args.learning_rate * args.dart_lr_scale,
                         "eps": args.adam_epsilon,
