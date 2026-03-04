@@ -42,12 +42,13 @@ DART_COMMON="\
     --num_ppo_epochs 4 \
     --num_mini_batches 1 \
     --learning_rate 3e-6 \
-    --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 16 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 32 \
     --total_episodes ${TOTAL_EPISODES} \
     --response_length ${RESPONSE_LENGTH} \
-    --local_rollout_forward_batch_size 4 \
+    --local_rollout_forward_batch_size 2 \
     --kl_coef 0.05 \
+    --gradient_checkpointing \
     --dart_enabled true \
     --dart_warmup_frac 0.4 \
     --eval_strategy steps \
