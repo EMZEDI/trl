@@ -536,29 +536,14 @@ class PPOTrainer(BaseTrainer):
                 base_params, lr=args.learning_rate, eps=args.adam_epsilon, weight_decay=args.weight_decay
             )
 
-            # Residual optimizer: residual critic only (will be prepared separately)
-            # When DeepSpeed CPU offload is enabled, we must use DeepSpeedCPUAdam.
-            _res_params = [p for p in self.value_model_residual.parameters() if p.requires_grad]
-            _use_cpu_offload = False
-            try:
-                _ds_plug = getattr(PartialState(), "deepspeed_plugin", None)
-                if _ds_plug is not None:
-                    _ds_cfg = _ds_plug.deepspeed_config
-                    _offload = _ds_cfg.get("zero_optimization", {}).get("offload_optimizer", {})
-                    if _offload.get("device", "none") != "none":
-                        _use_cpu_offload = True
-            except Exception:
-                pass
-
-            if _use_cpu_offload:
-                from deepspeed.ops.adam import DeepSpeedCPUAdam
-                self.optimizer_res = DeepSpeedCPUAdam(
-                    _res_params,
-                    lr=args.learning_rate * args.dart_lr_scale,
-                    eps=args.adam_epsilon,
-                    weight_decay=args.weight_decay,
-                )
+            # Residual optimizer & scheduler: created differently depending on DeepSpeed.
+            # When DeepSpeed is active, deepspeed.initialize() creates the optimizer
+            # (handling CPU offload automatically), so we defer creation.
+            if self.is_deepspeed_enabled:
+                self.optimizer_res = None
+                self.lr_scheduler_res = None
             else:
+                _res_params = [p for p in self.value_model_residual.parameters() if p.requires_grad]
                 self.optimizer_res = torch.optim.AdamW(
                     _res_params,
                     lr=args.learning_rate * args.dart_lr_scale,
@@ -574,12 +559,13 @@ class PPOTrainer(BaseTrainer):
                 num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
                 num_training_steps=args.num_total_batches,
             )
-            self.lr_scheduler_res = get_scheduler(
-                name=args.lr_scheduler_type,
-                optimizer=self.optimizer_res,
-                num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
-                num_training_steps=args.num_total_batches,
-            )
+            if self.optimizer_res is not None:
+                self.lr_scheduler_res = get_scheduler(
+                    name=args.lr_scheduler_type,
+                    optimizer=self.optimizer_res,
+                    num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
+                    num_training_steps=args.num_total_batches,
+                )
         else:
             self.create_optimizer_and_scheduler(
                 num_training_steps=args.num_total_batches
@@ -694,11 +680,17 @@ class PPOTrainer(BaseTrainer):
                     ds_config["zero_optimization"]["reduce_bucket_size"] = hidden_size * hidden_size
                     ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 10 * hidden_size
                     ds_config["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
-                self.value_model_residual, self.optimizer_res, _, self.lr_scheduler_res = deepspeed.initialize(
+                self.value_model_residual, self.optimizer_res, _, _ = deepspeed.initialize(
                     model=self.value_model_residual,
-                    optimizer=self.optimizer_res,
-                    lr_scheduler=self.lr_scheduler_res,
                     config=ds_config,
+                )
+                # Create residual lr_scheduler from the DeepSpeed-created optimizer
+                from transformers.optimization import get_scheduler as _get_scheduler
+                self.lr_scheduler_res = _get_scheduler(
+                    name=args.lr_scheduler_type,
+                    optimizer=self.optimizer_res,
+                    num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
+                    num_training_steps=args.num_total_batches,
                 )
         else:
             if self.ref_model is None:
