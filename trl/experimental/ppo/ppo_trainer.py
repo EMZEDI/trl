@@ -664,6 +664,16 @@ class PPOTrainer(BaseTrainer):
                         "eps": args.adam_epsilon,
                     },
                 }
+                # Let DeepSpeed create the scheduler so it wraps its own optimizer type
+                ds_config["scheduler"] = {
+                    "type": "WarmupDecayLR",
+                    "params": {
+                        "warmup_min_lr": 0,
+                        "warmup_max_lr": args.learning_rate * args.dart_lr_scale,
+                        "warmup_num_steps": args.get_warmup_steps(args.num_total_batches),
+                        "total_num_steps": args.num_total_batches,
+                    },
+                }
                 ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
                 ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
                 world_size = self.accelerator.num_processes
@@ -677,17 +687,9 @@ class PPOTrainer(BaseTrainer):
                     ds_config["zero_optimization"]["reduce_bucket_size"] = hidden_size * hidden_size
                     ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 10 * hidden_size
                     ds_config["zero_optimization"]["stage3_prefetch_bucket_size"] = 0
-                self.value_model_residual, self.optimizer_res, _, _ = deepspeed.initialize(
+                self.value_model_residual, self.optimizer_res, _, self.lr_scheduler_res = deepspeed.initialize(
                     model=self.value_model_residual,
                     config=ds_config,
-                )
-                # Create residual lr_scheduler from the DeepSpeed-created optimizer
-                from transformers.optimization import get_scheduler as _get_scheduler
-                self.lr_scheduler_res = _get_scheduler(
-                    name=args.lr_scheduler_type,
-                    optimizer=self.optimizer_res,
-                    num_warmup_steps=args.get_warmup_steps(args.num_total_batches),
-                    num_training_steps=args.num_total_batches,
                 )
         else:
             if self.ref_model is None:
@@ -1195,7 +1197,11 @@ class PPOTrainer(BaseTrainer):
 
                 if args.dart_enabled:
                     metrics["lr_base"] = self.lr_scheduler.get_last_lr()[0]
-                    metrics["lr_res"] = self.lr_scheduler_res.get_last_lr()[0]
+                    # DeepSpeed scheduler uses get_lr(); torch scheduler uses get_last_lr()
+                    if hasattr(self.lr_scheduler_res, "get_last_lr"):
+                        metrics["lr_res"] = self.lr_scheduler_res.get_last_lr()[0]
+                    else:
+                        metrics["lr_res"] = self.lr_scheduler_res.get_lr()[0]
                 else:
                     metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
