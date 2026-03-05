@@ -657,11 +657,8 @@ class PPOTrainer(BaseTrainer):
                 ds_plugin = self.accelerator.state.deepspeed_plugin
                 ds_config = deepcopy(ds_plugin.deepspeed_config)
                 # Use the residual-specific learning rate.
-                # When CPU offload is active, use DeepSpeedCPUAdam; else AdamW.
-                _offload_cfg = ds_config.get("zero_optimization", {}).get("offload_optimizer", {})
-                _opt_type = "DeepSpeedCPUAdam" if _offload_cfg.get("device", "none") != "none" else "AdamW"
                 ds_config["optimizer"] = {
-                    "type": _opt_type,
+                    "type": "AdamW",
                     "params": {
                         "lr": args.learning_rate * args.dart_lr_scale,
                         "eps": args.adam_epsilon,
